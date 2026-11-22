@@ -29,9 +29,9 @@ With Exa MCP: current info works, up to 150 free calls per day.
 
 ## Tested on
 
-- 【entity-Lenovo¦canonical_name=Lenovo】 ThinkBook 14 G9 AHP, model code 21V0
-- 【entity-AMD¦canonical_name=AMD】 Ryzen 7 250, 8 cores, 16 threads
-- 【entity-AMD¦canonical_name=AMD】 Radeon 780M, integrated, shared memory, no dedicated VRAM
+- ThinkBook 14 G9 AHP, model code 21V0
+- Ryzen 7 250, 8 cores, 16 threads
+- Radeon 780M, integrated, shared memory, no dedicated VRAM
 - 16 GB DDR5-5600 RAM
 - Windows 11, Python 3, llama.cpp with Vulkan
 - Folder: C:\prism-llama
