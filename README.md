@@ -7,11 +7,17 @@ This launcher starts llama-server.exe on your own laptop. Your prompts stay on y
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
+
 [Model loaded in launcher](screenshot-loaded.png)
+
 [Model running log](screenshot-running.png)
+
 [PC memory usage breakdown](screenshot-memory.png)
+
 [Localhost chat screen](screenshot-chat.png)
+
 [LLM response on localhost chat](screenshot-response.png)
+
 [Log screen in Launcher](screenshot-log.png)
 
 ## Demo Video
