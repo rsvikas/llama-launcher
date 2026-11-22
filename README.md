@@ -4,6 +4,16 @@ Run local AI on a normal 16 GB laptop. No cloud. No API key. No subscription.
 
 This launcher starts llama-server.exe on your own laptop. Your prompts stay on your laptop. It works without internet.
 
+## Screenshots
+
+[List of models in Launcher](screenshot-models.png)
+[Model loaded in launcher](screenshot-loaded.png)
+[Model running log](screenshot-running.png)
+[PC memory usage breakdown](screenshot-memory.png)
+[Localhost chat screen](screenshot-chat.png)
+[LLM response on localhost chat](screenshot-response.png)
+[Log screen in Launcher](screenshot-log.png)
+
 ## What is inside this repo
 
 - `llama_launcher.pyw` - The launcher. Double click to run.
