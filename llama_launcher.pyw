@@ -1,0 +1,1850 @@
+"""
+Llama Launcher - start / stop / switch llama.cpp models with one click.
+Double-click to run (Python 3 + tkinter). Edit PRESETS to add or change models.
+"Clear RAM" file-cache flush needs admin (use the "Restart as Admin" button once).
+
+Every sampler below was cross-checked against the publisher's own documentation
+(the SOURCES table right above PRESETS lists the links).  Where a publisher
+publishes no fixed table, the preset says so instead of pretending one exists.
+"""
+import csv
+import glob
+import hashlib
+import json
+import urllib.error
+import urllib.request
+import ctypes
+import os
+import queue
+import re
+import struct
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from ctypes import wintypes
+from tkinter import ttk, messagebox
+
+BASE_DIR = r"C:\prism-llama"
+DEFAULT_PORT = "8080"
+NO_WINDOW = 0x08000000
+
+# llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
+# Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
+# the "Prompt cache" row of the memory tab reads.  Level 5 (debug) is far too
+# noisy, so we stop at 4.  Set to [] to go back to the server default.
+EXTRA_SERVER_ARGS = []   # not a publisher setting; ["--verbosity", "4"] adds the prompt-cache log line but is noisy
+
+# llama.cpp reasoning switch.  "auto" is NOT neutral: server-context.cpp does
+#   enable_thinking = (enable_reasoning != 0) && template_supports_thinking
+# so auto turns thinking ON for every template that supports enable_thinking,
+# even when the template itself defaults it to false (Gemma 4 E4B does).
+# We therefore state the mode explicitly on every preset.
+REASONING_ON = ["--reasoning", "on"]
+REASONING_OFF = ["--reasoning", "off"]
+
+def ctx(n=16384, b=512, ub=512, ngl=99):
+    return ["-c", str(n), "-np", "1", "-ngl", str(ngl), "-b", str(b), "-ub", str(ub)]
+
+KV = ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "2048"]
+
+# --- PrismML "Ternary Bonsai 2" samplers ---------------------------------
+# https://docs.prismml.com/models/bonsai-2-27b -> "Best practices / Generation parameters"
+#   thinking : temperature 1.0 | top_p 0.95 | top_k 20 | min_p 0.05 | presence 0.0 | repetition 1.0
+#   instruct : temperature 0.7 | top_p 0.80 | top_k 20 | min_p 0.0  | presence 1.5 | repetition 1.0
+# https://docs.prismml.com/models/bonsai-2-9b -> thinking: min_p 0.0, presence 1.0 (same otherwise)
+# Both pair presence_penalty with "--repeat-last-n 64" (llama.cpp's default window).
+SAMPLING_27B = ["--jinja", "--temp", "1.0", "--top-p", "0.95", "--top-k", "20",
+                "--min-p", "0.05", "--presence-penalty", "0.0",
+                "--repeat-penalty", "1.0", "--repeat-last-n", "64"]
+SAMPLING_9B = ["--jinja", "--temp", "1.0", "--top-p", "0.95", "--top-k", "20",
+               "--min-p", "0.0", "--presence-penalty", "1.0",
+               "--repeat-penalty", "1.0", "--repeat-last-n", "64"]
+BONSAI_INSTRUCT_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.80", "--top-k", "20",
+                            "--min-p", "0", "--presence-penalty", "1.5",
+                            "--repeat-penalty", "1.0", "--repeat-last-n", "64"]
+
+def think(n):
+    return ["--reasoning-budget", str(n)]
+
+def resolve_file(name):
+    """Return the real on-disk file name in BASE_DIR, matched case-insensitively.
+
+    Publishers are not consistent about case ("Qwen2.5-Coder-7B-Instruct-Q6_K.gguf"
+    vs the published "qwen2.5-coder-7b-instruct-q6_k.gguf").  Windows hides the
+    difference, but the launcher should still report the name that is really
+    there.  Returns `name` unchanged when nothing matches, so the "missing file"
+    message keeps showing what was expected.
+    """
+    if not name:
+        return name
+    if os.path.isfile(os.path.join(BASE_DIR, name)):
+        return name
+    try:
+        entries = os.listdir(BASE_DIR)
+    except OSError:
+        return name
+    low = name.lower()
+    for e in entries:
+        if e.lower() == low and os.path.isfile(os.path.join(BASE_DIR, e)):
+            return e
+    return name
+
+def preset(name, model, extra, exe="llama-server.exe", mmproj=None):
+    model = resolve_file(model)
+    args = ["-m", os.path.join(".", model)]
+    if mmproj:
+        mmproj = resolve_file(mmproj)
+        args += ["--mmproj", os.path.join(".", mmproj)]
+    return {"name": name, "exe": exe, "args": args + extra}
+
+# Projector preference: Q8_0 first (smallest), then f16, then bf16 (reference
+# precision), matching what each publisher recommends.
+_MM_RANK = ("q8_0", "q4_0", "f16", "bf16", "f32")
+
+def find_mmproj(patterns):
+    """Find a projector file.  `patterns` is a list of globs tried in order.
+
+    Both naming styles are in the wild ("mmproj-<model>-f16.gguf" and
+    "<model>-mmproj.gguf"), so every projector is looked up with both.
+    """
+    hits = []
+    for pat in patterns:
+        hits = sorted(glob.glob(os.path.join(BASE_DIR, pat)))
+        if hits:
+            break
+    if not hits:
+        return None
+    def rank(path):
+        low = os.path.basename(path).lower()
+        for i, q in enumerate(_MM_RANK):
+            if q in low:
+                return i
+        return len(_MM_RANK)
+    hits.sort(key=lambda p: (rank(p), p))
+    return os.path.basename(hits[0])
+
+# --- Google Gemma 4 E4B --------------------------------------------------
+# https://ai.google.dev/gemma/docs/core/model_card_4 -> "Sampling Parameters":
+#   "Use the following standardized sampling configuration across all use cases:
+#    temperature=1.0, top_p=0.95, top_k=64"
+# google/gemma-4-E4B-it generation_config.json agrees (temp 1.0, top_k 64, top_p 0.95).
+# The remaining flags are llama.cpp defaults, spelled out so the command is explicit.
+GEMMA_SAMPLING = ["--jinja", "--temp", "1.0", "--top-p", "0.95", "--top-k", "64",
+                  "--min-p", "0", "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
+# --- Qwen3-8B -------------------------------------------------------------
+# https://huggingface.co/Qwen/Qwen3-8B -> "Best Practices":
+#   thinking mode    : Temperature 0.6, TopP 0.95, TopK 20, MinP 0
+#   non-thinking mode: Temperature 0.7, TopP 0.8,  TopK 20, MinP 0
+# The card fixes no repetition penalty; 0.0 / 1.0 are the llama.cpp defaults.
+QWEN_SAMPLING = ["--jinja", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20",
+                 "--min-p", "0", "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
+QWEN_NON_THINKING_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.80", "--top-k", "20",
+                              "--min-p", "0", "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
+# --- Meta Llama 3.1 8B ---------------------------------------------------
+# The Llama 3.1 model card has no sampling table, but Meta's shipped generation_config.json
+# (meta-llama/Llama-3.1-8B-Instruct) sets: do_sample true, temperature 0.6, top_p 0.9.
+# Nothing else is set there, so nothing else is passed except the explicit "disabled" values.
+LLAMA_SAMPLING = ["--jinja", "--temp", "0.6", "--top-p", "0.9", "--min-p", "0",
+                  "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
+# --- Qwen2.5-VL 7B -------------------------------------------------------
+# The model card has no sampling table. The shipped generation_config.json is the only official
+# source: temperature ~0 (greedy) + repetition_penalty 1.05.
+# NOTE: the "temp 0.7 / top_p 0.8 / top_k 20 / presence 1.5" block on the QwenLM GitHub pages
+# belongs to Qwen3-VL, not Qwen2.5-VL.
+QWENVL_GENCFG_SAMPLING = ["--jinja", "--temp", "0.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0",
+                          "--presence-penalty", "0.0", "--repeat-penalty", "1.05"]
+# --- Qwen2.5-Coder 7B ----------------------------------------------------
+# Qwen/Qwen2.5-Coder-7B-Instruct generation_config.json (the card has no table):
+#   temperature 0.7 | top_p 0.8 | top_k 20 | repetition_penalty 1.1
+QWEN_CODER_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.8", "--top-k", "20", "--min-p", "0",
+                       "--presence-penalty", "0.0", "--repeat-penalty", "1.1"]
+# --- SmolVLM2 500M Video -------------------------------------------------
+# The model card's examples all use do_sample=False -> greedy decoding, and
+# preprocessor_config.json has video_sampling.fps = 1 (hence --video-fps 1).
+SMOL_SAMPLING = ["--jinja", "--temp", "0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0",
+                 "--presence-penalty", "0.0", "--repeat-penalty", "1.0"]
+# --- Qwen3-ASR 1.7B ------------------------------------------------------
+# Model card: "During evaluation ... Greedy search was used for all decoding."
+# generation_config.json: do_sample false.
+ASR_SAMPLING = ["--jinja", "--temp", "0.0", "--top-p", "1.0", "--top-k", "0", "--min-p", "0",
+                "--presence-penalty", "0.0", "--repeat-penalty", "1.1", "--repeat-last-n", "64"]
+
+# --- Next six models: publisher-documented values only -------------------
+# No top_k / repeat penalty unless the publisher publishes it. "--jinja" is the chat template
+# (needed for --reasoning), not a sampler; it is in every list to match the rest of this file.
+MIMO_SAMPLING = ["--jinja", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]      # Xiaomi generation_config.json
+QWEN35_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.8", "--top-k", "20"]    # Qwen3.5-9B card, NON-thinking mode
+NEMOTRON_4B_SAMPLING = ["--jinja", "--temp", "1.0", "--top-p", "0.95"]              # NVIDIA Nemotron 3 Nano 4B, reasoning
+DEEPSEEK_R1_SAMPLING = ["--jinja", "--temp", "0.6", "--top-p", "0.95"]              # DeepSeek-R1 README temp; top-p from distill config
+MINISTRAL_SAMPLING = ["--jinja", "--temp", "0.15", "--top-p", "1.0"]                # Mistral Instruct guidance (0.15 or 0.1)
+
+VISION = dict(b=512, ub=512)
+
+# Projector files: try "<name>-mmproj*.gguf" and "mmproj-<name>*.gguf".
+_ASR_MM = find_mmproj(["mmproj*Qwen3-ASR*.gguf", "*Qwen3-ASR*mmproj*.gguf"])
+_SMOL_MM = find_mmproj(["mmproj*SmolVLM2*.gguf", "*SmolVLM2*mmproj*.gguf"])
+_BONSAI9_MM = find_mmproj(["*Bonsai-2-9B-mmproj*.gguf", "mmproj*Bonsai-2-9B*.gguf"])
+# Gemma's projector is published BOTH ways: ggml-org ships
+# "mmproj-gemma-4-E4B-it-Q8_0.gguf", google ships "gemma-4-E4B-it-mmproj.gguf".
+_GEMMA_MM = find_mmproj(["mmproj*gemma*.gguf", "*gemma*mmproj*.gguf"])
+_QWENVL_MM = find_mmproj(["mmproj*Qwen2.5-VL*.gguf", "*Qwen2.5-VL*mmproj*.gguf"])
+_ULTRAVOX_MM = find_mmproj(["mmproj*ultravox*.gguf", "*ultravox*mmproj*.gguf"])
+
+# --- PrismML fork detection: hard gate ---
+def _llama_exe():
+    cand = os.path.join(BASE_DIR, "llama-server.exe")
+    return cand if os.path.exists(cand) else "llama-server.exe"
+
+def _run_capture(args):
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW)
+        return (out.stdout + out.stderr).lower()
+    except Exception:
+        return ""
+
+def _detect_prism_robust():
+    env = os.environ.get("BONSAI_PRISM", "").strip().lower()
+    if env in ("1", "true", "yes", "prism"):
+        return True, "override BONSAI_PRISM=1"
+    if env in ("0", "false", "no", "stock", "upstream"):
+        return False, "override BONSAI_PRISM=0"
+    if os.path.exists(os.path.join(BASE_DIR, "USE_PRISM")):
+        return True, "marker file USE_PRISM"
+    if os.path.exists(os.path.join(BASE_DIR, "USE_Q2")):
+        return False, "marker file USE_Q2"
+    # A PQ2_0 / PTQ1_0 file in this folder is the strongest signal we have: a stock build cannot load those
+    # files at all. Checking the file is more reliable than --help, which does not list weight types.
+    for label in ("27B", "9B"):
+        for f in BONSAI_PACKS[label]["fork"]:
+            if os.path.exists(os.path.join(BASE_DIR, f)):
+                return True, f"PrismML-only Bonsai file present: {f}"
+    exe = _llama_exe()
+    help_txt = _run_capture([exe, "--help"])
+    # pq2_0 / ptq1_0 are PrismML-only ggml types: an unambiguous signal.
+    if any(term in help_txt for term in ("pq2_0", "ptq1_0")):
+        return True, "help text lists the PrismML types pq2_0/ptq1_0"
+    if any(term in help_txt for term in ("ternary", "prism")):
+        return True, "help text mentions ternary/prism types"
+    ver = _run_capture([exe, "--version"])
+    if re.search(r"prism-b\d{4,}", ver):
+        return True, f"version matches prism-bNNNN pattern: {ver[:80]}"
+    return False, "no ternary/prism capability found in --help or --version"
+
+def _first_existing(candidates):
+    for name in candidates:
+        if os.path.exists(os.path.join(BASE_DIR, name)):
+            return name
+    return None
+
+# PrismML publishes three GGUF packings for Bonsai 2
+# (https://docs.prismml.com/download/formats):
+#   PQ2_0  - publisher default, faster prompt processing -> PrismML binaries only
+#   PTQ1_0 - smallest, faster decode on Ada / L4          -> PrismML binaries only
+#   Q2_0   - upstream llama.cpp b11555+ (also runs on the PrismML binaries)
+# A stock build REFUSES pq2_0 / ptq1_0 ("unknown type"), so the fork decides
+# which packings may be used.
+BONSAI_PACKS = {
+    "27B": {
+        "fork":  ["Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
+        # The 27B Q2_0 pack is only published in the "-gguf-dev" repo, under the
+        # historical "-prism-fork-required" name (the suffix is historical - the
+        # file does run on upstream llama.cpp b11555+).
+        "stock": ["Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf"],
+        "fork_repo":  "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        "stock_repo": "prism-ml/Ternary-Bonsai-2-27B-gguf-dev",
+    },
+    "9B": {
+        "fork":  ["Ternary-Bonsai-2-9B-PQ2_0.gguf", "Ternary-Bonsai-2-9B-PTQ1_0.gguf"],
+        "stock": ["Ternary-Bonsai-2-9B-Q2_0.gguf"],
+        "fork_repo":  "prism-ml/Ternary-Bonsai-2-9B-gguf",
+        "stock_repo": "prism-ml/Ternary-Bonsai-2-9B-gguf",
+    },
+}
+BONSAI_PACK_SIZES = {
+    "Ternary-Bonsai-2-27B-PQ2_0.gguf": "~7.21 GB",
+    "Ternary-Bonsai-2-27B-PTQ1_0.gguf": "~5.95 GB",
+    "Ternary-Bonsai-2-27B-Q2_0.gguf": "~7.63 GB",
+    "Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf": "~7.63 GB",
+    "Ternary-Bonsai-2-9B-PQ2_0.gguf": "~2.42 GB",
+    "Ternary-Bonsai-2-9B-PTQ1_0.gguf": "~2.00 GB",
+    "Ternary-Bonsai-2-9B-Q2_0.gguf": "~2.56 GB",
+}
+
+STARTUP_NOTICES = []
+
+def _ensure_bonsai_pack(label, is_prism):
+    """Pick the Bonsai 2 GGUF packing to use and explain what to download.
+
+    Does NOT raise.  Returns the preferred candidate even if missing, so the
+    preset stays visible and start() blocks with the missing-file list.
+    """
+    pack = BONSAI_PACKS[label]
+    # Q2_0 also runs on the PrismML binaries, so it is a valid fallback there.
+    candidates = list(pack["fork"]) + list(pack["stock"]) if is_prism else list(pack["stock"])
+    # Use whatever is really on disk. A PQ2_0 / PTQ1_0 file can only be there because the PrismML binaries are in
+    # use (a stock build cannot even load it), and "--help" does not list weight types, so detection can be wrong.
+    ordered = (list(pack["fork"]) + list(pack["stock"])) if is_prism else (list(pack["stock"]) + list(pack["fork"]))
+    found = _first_existing(ordered)
+    if found:
+        if not is_prism and found in pack["fork"]:
+            STARTUP_NOTICES.append(f"[INFO] Bonsai 2 {label}: using {found}. Stock llama.cpp was assumed, but this "
+                                   f"file needs the PrismML binaries; if the server says 'unknown type', see "
+                                   f"https://docs.prismml.com/download/formats")
+        return found
+
+    msg = [f"[MISSING] Bonsai 2 {label}: no usable GGUF packing found in {BASE_DIR}."]
+    if not is_prism:
+        # The user may own the publisher's pack but be running a stock build.
+        for f in pack["fork"]:
+            if os.path.isfile(os.path.join(BASE_DIR, f)):
+                msg.append(f"  NOTE: {f} IS in {BASE_DIR}, but a stock llama.cpp refuses the "
+                           f"PQ2_0/PTQ1_0 types ('unknown type').")
+                msg.append("        Install the PrismML binaries (https://github.com/PrismML-Eng/llama.cpp) "
+                           "or set BONSAI_PRISM=1 after installing them,")
+                msg.append("        or download the upstream Q2_0 pack listed below instead.")
+                break
+    if is_prism:
+        msg.append("  PrismML fork detected - preferred packs (PQ2_0 = publisher default):")
+        for f in pack["fork"]:
+            msg.append(f"    hf download {pack['fork_repo']} {f} --local-dir .    ({BONSAI_PACK_SIZES.get(f, '')})")
+        msg.append("  Any of these also works on stock llama.cpp b11555+:")
+    else:
+        msg.append("  Stock llama.cpp detected - only the upstream Q2_0 type runs here:")
+    for f in pack["stock"]:
+        repo = pack["stock_repo"]
+        msg.append(f"    hf download {repo} {f} --local-dir .    ({BONSAI_PACK_SIZES.get(f, '')})")
+    msg.append("  (Place the file in " + BASE_DIR + ".)")
+    STARTUP_NOTICES.append("\n".join(msg))
+    print("\n".join(msg))
+    return candidates[0]
+
+_is_prism, _prism_reason = _detect_prism_robust()
+print(f"[INFO] Prism detection: {_is_prism} ({_prism_reason})")
+if not _is_prism:
+    print("=" * 60)
+    print("  STOCK llama.cpp detected - only the upstream Q2_0 packing runs here.")
+    print("  If you installed the PrismML fork and want PQ2_0 / PTQ1_0:")
+    print("    set BONSAI_PRISM=1    (Windows)  or  export BONSAI_PRISM=1")
+    print("  Or create an empty file named USE_PRISM in BASE_DIR.")
+    print("=" * 60)
+else:
+    print("=" * 60)
+    print("  PrismML fork detected - PQ2_0 / PTQ1_0 packings are available.")
+    print("=" * 60)
+
+BONSAI_27B_FILE = _ensure_bonsai_pack("27B", _is_prism)
+BONSAI_9B_FILE = _ensure_bonsai_pack("9B", _is_prism)
+
+# --- Where every preset value above comes from -----------------------------
+# Bonsai 2 27B   https://docs.prismml.com/models/bonsai-2-27b   ("Best practices")
+# Bonsai 2 9B    https://docs.prismml.com/models/bonsai-2-9b    ("Best practices")
+# Bonsai packs   https://docs.prismml.com/download/formats      (PQ2_0 / PTQ1_0 / Q2_0)
+# Gemma 4 E4B    https://ai.google.dev/gemma/docs/core/model_card_4  ("Sampling Parameters")
+# Qwen3-8B       https://huggingface.co/Qwen/Qwen3-8B            ("Best Practices")
+#                https://qwen.readthedocs.io/en/latest/run_locally/llama.cpp.html (llama-cli cmd)
+# Llama 3.1      meta-llama/Llama-3.1-8B-Instruct generation_config.json (temp 0.6, top_p 0.9)
+# Qwen2.5-VL     https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct (generation_config.json)
+#                https://qwen.readthedocs.io/en/latest/run_locally/llama.cpp.html (Qwen3 flags)
+# Qwen2.5-Coder  https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct (generation_config.json)
+# Qwen3-ASR      https://huggingface.co/Qwen/Qwen3-ASR-1.7B      ("Greedy search was used")
+# SmolVLM2       https://huggingface.co/HuggingFaceTB/SmolVLM2-500M-Video-Instruct
+# MiMo-V2.6      XiaomiMiMo/MiMo-V2.6-Distill-Qwen-9B generation_config.json (temp 0.6, top_p 0.95, top_k 20)
+# Qwen3.5-9B     https://huggingface.co/Qwen/Qwen3.5-9B  (non-thinking 0.7/0.8/20; thinking 1.0/0.95/20)
+# Nemotron 3 4B  https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16 (reasoning 1.0/0.95; tool calling 0.6/0.95)
+# Nemotron 9B v2 https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2 (reasoning on: 0.6/0.95)
+# DeepSeek-R1    https://github.com/deepseek-ai/DeepSeek-R1 (temp 0.5-0.7, recommended 0.6)
+# Ministral 3 8B https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512 (Instruct: temp 0.15 or 0.1)
+# llama.cpp CLI  https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
+PRESETS = [
+    preset("1. Bonsai 2 27B  |  THINKING (publisher sampler)", BONSAI_27B_FILE, ctx(8192) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
+    preset("1b. Bonsai 2 27B  |  THINKING, low memory (ctx 4096)", BONSAI_27B_FILE, ctx(4096, b=128, ub=64) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
+    preset("1c. Bonsai 2 27B  |  INSTRUCT, no thinking (publisher sampler)", BONSAI_27B_FILE, ctx(8192) + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
+    preset("2. Bonsai 2 9B  |  THINKING (publisher sampler)", BONSAI_9B_FILE, ctx() + KV + SAMPLING_9B + REASONING_ON + think(-1)),
+    preset("2b. Bonsai 2 9B  |  INSTRUCT, no thinking (publisher sampler)", BONSAI_9B_FILE, ctx() + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
+    preset("3. Bonsai 2 9B  |  IMAGES, thinking (chat only, not Cline)" + ("" if _BONSAI9_MM else " (no mmproj: text-only)"), BONSAI_9B_FILE, ctx(**VISION) + KV + SAMPLING_9B + REASONING_ON + think(-1), mmproj=_BONSAI9_MM),
+    preset("4. Gemma 4 E4B  |  Google sampler, reasoning OFF", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_OFF),
+    preset("4b. Gemma 4 E4B  |  Google sampler, reasoning ON", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_ON),
+    preset("5. Qwen3 8B  |  THINKING (Qwen model-card values)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_SAMPLING + REASONING_ON + think(-1)),
+    preset("5b. Qwen3 8B  |  NON-THINKING (Qwen model-card values)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_NON_THINKING_SAMPLING + REASONING_OFF),
+    preset("6. Llama 3.1 8B  |  Meta generation_config (community GGUF)", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(8192) + KV + LLAMA_SAMPLING),
+    preset("7. Gemma 4 E4B  |  VISION, Google sampler (chat only)" + ("" if _GEMMA_MM else " (no mmproj: text-only)"), "gemma-4-E4B_q4_0-it.gguf", ctx(16384, **VISION) + KV + GEMMA_SAMPLING + REASONING_OFF, mmproj=_GEMMA_MM),
+    preset("8. Qwen2.5-VL 7B  |  VISION (Qwen generation_config)" + ("" if _QWENVL_MM else " (no mmproj: text-only)"), "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + QWENVL_GENCFG_SAMPLING, mmproj=_QWENVL_MM),
+    # ggml-org/ultravox-v0_5-llama-3_1-8b-GGUF ships its weights under the same file name as plain Llama 3.1;
+    # the projector is what makes it Ultravox.
+    preset("9. Ultravox audio  |  EXPERIMENTAL (Llama 3.1 + projector)" + ("" if _ULTRAVOX_MM else " (no mmproj: text-only)"), "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(4096, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "256"] + LLAMA_SAMPLING, mmproj=_ULTRAVOX_MM),
+    preset("10. Qwen3-ASR 1.7B  |  GREEDY (publisher method)" + ("" if _ASR_MM else " (no mmproj: text-only)"), "Qwen3-ASR-1.7B-Q8_0.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + ASR_SAMPLING, mmproj=_ASR_MM),
+    preset("11. SmolVLM2 500M  |  VIDEO, greedy (fps 1)" + ("" if _SMOL_MM else " (no mmproj: text-only)"), "SmolVLM2-500M-Video-Instruct-Q8_0.gguf", ctx(8192, **VISION) + KV + ["--video-fps", "1"] + SMOL_SAMPLING, mmproj=_SMOL_MM),
+    preset("12. Qwen2.5-Coder 7B Q6_K  |  Qwen generation_config", "Qwen2.5-Coder-7B-Instruct-Q6_K.gguf", ctx(8192) + KV + QWEN_CODER_SAMPLING),
+    preset("13. Qwen2.5-Coder 14B Q4_K_M  |  CODING, partial GPU (experimental)", "qwen2.5-coder-14b-instruct-q4_k_m.gguf", ctx(4096, b=128, ub=32, ngl=16) + ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--cache-ram", "2048"] + QWEN_CODER_SAMPLING),
+    preset("14. MiMo-V2.6-Distill-Qwen-9B Q4_K_M  |  AGENTIC, publisher sampler", "MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MIMO_SAMPLING + REASONING_ON),
+    # Decode OOM on a 512-token prompt: GPU-side memory, so fewer GPU layers. KV stays q8_0 (this hybrid model
+    # keeps KV in only 8 of 32 layers, so a q4_0 switch saves a few MiB). --cache-ram is host RAM, not GPU.
+    preset("15. MiMo-V2.6-Distill-Qwen-9B Q8_0", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", ctx(2048, b=64, ub=32, ngl=4) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "1024"] + ["--jinja", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]),
+    preset("16. Qwen3.5-9B Q4_K_M  |  GENERAL, non-thinking (Qwen card)", "Qwen3.5-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + QWEN35_SAMPLING + REASONING_OFF),
+    preset("17. Nemotron 3 Nano 4B Q4_K_M  |  REASONING (NVIDIA sampler)", "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf", ctx(65536) + KV + NEMOTRON_4B_SAMPLING + REASONING_ON),
+    preset("18. DeepSeek-R1-Distill-Qwen-7B Q4_K_M  |  REASONING (DeepSeek sampler)", "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + DEEPSEEK_R1_SAMPLING + REASONING_ON),
+    preset("19. Ministral 3 8B Instruct 2512 Q4_K_M  |  DENSE, Mistral Instruct guidance", "Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MINISTRAL_SAMPLING),
+    preset("20. Nemotron-Nano-9B-v2 Q4_K_M OFFICIAL", "Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf", ctx(4096, b=128, ub=32, ngl=16) + KV + ["--jinja", "--temp", "0.6", "--top-p", "0.95"]),
+]
+def _preset_files(p):
+    names = [p["exe"]]
+    for flag in ("-m", "--mmproj"):
+        if flag in p["args"]:
+            f = p["args"][p["args"].index(flag) + 1]
+            # FIX 4: use basename, not f[2:] slicing
+            names.append(os.path.basename(f))
+    return names
+
+MISSING_FILES = {p["name"]: [n for n in _preset_files(p) if not os.path.isfile(os.path.join(BASE_DIR, n))]
+                 for p in PRESETS}
+# FIX 4: DO NOT hide missing presets. Keep them all visible so the user sees why one fails.
+# The startup log lists what is missing for each of them instead.
+
+PROCESS_NAMES = ["llama-server.exe", "llama-bench.exe"]
+# llama.cpp prints one line per buffer, device name in the middle:
+#   llama_model_load:          CPU model buffer size =  4096.00 MiB
+#   llama_kv_cache_init:       CUDA0 KV buffer size =  1024.00 MiB
+#   llama_memory_recurrent:    CUDA0 RS buffer size =    12.34 MiB
+#   llama_context:             CPU compute buffer size =  512.00 MiB
+#   llama_context:             CPU  output buffer size =     1.00 MiB
+MEM_RE = re.compile(r"(\S+)\s+(model|KV|RS|compute|output)\s+buffer size\s*=\s*([\d.]+)\s*MiB")
+# server trace line: " - cache state: 3 prompts, 12.345 MiB (limits: 2048.000 MiB, ...)"
+# (trace level only - the launcher starts the server with --verbosity 4 for it)
+CACHE_RE = re.compile(r"cache state:\s*(\d+)\s+prompts?,\s*([\d.]+)\s*MiB")
+# "failed to allocate output buffer of size 1234.56 MiB"  (the size is already MiB)
+FAIL_MIB_RE = re.compile(r"failed to allocate (\S+) buffer of size ([\d.]+)\s*MiB")
+# "failed to allocate compute pp buffers" / "failed to allocate compute buffers"
+FAIL_RAW_RE = re.compile(r"failed to allocate (\S+) buffer of size (\d+)\s*$")   # bytes, e.g. "...Vulkan0 buffer of size 176173060"
+FAIL_BUF_RE = re.compile(r"failed to allocate (compute pp buffers|compute tg buffers|compute buffers)")
+# "failed to allocate a 123456-byte staging buffer"
+FAIL_BYTES_RE = re.compile(r"failed to allocate a (\d+)-byte")
+
+COMPONENTS = [
+    ("model", "Model weights", "#4c78a8", "Model file. Updated below."),
+    ("kv", "KV cache", "#f58518", "Memory for this chat. Updated below."),
+    ("rs", "Recurrent state", "#b279a2", "Fixed memory. Only some models need it."),
+    ("compute", "Compute buffers", "#54a24b", "Rough work for reading your question. Updated below."),
+    ("output", "Output buffer", "#e45756", "Marks for the next word. Updated below."),
+    ("cache", "Prompt cache / growth", "#72b7b2", "Saved work from old questions. Updated below."),
+    ("other", "Other host RAM", "#b0b0b0", "The app's own memory. Updated below."),
+]
+
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+def ram_info():
+    st = MEMORYSTATUSEX()
+    st.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+    gb = 1024 ** 3
+    used = (st.ullTotalPhys - st.ullAvailPhys) / gb
+    return used, st.ullTotalPhys / gb, st.dwMemoryLoad
+
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+def clear_standby_ram():
+    if not is_admin():
+        return False, "not admin - process memory freed, but Windows file cache not flushed"
+    class LUID(ctypes.Structure):
+        _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+    class LUID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Luid", LUID), ("Attributes", wintypes.DWORD)]
+    class TOKEN_PRIVILEGES(ctypes.Structure):
+        _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Privileges", LUID_AND_ATTRIBUTES * 1)]
+    k32, adv, nt = ctypes.windll.kernel32, ctypes.windll.advapi32, ctypes.windll.ntdll
+    k32.GetCurrentProcess.restype = wintypes.HANDLE
+    adv.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    adv.AdjustTokenPrivileges.argtypes = [wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES),
+                                          wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p]
+    adv.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+    token = wintypes.HANDLE()
+    if not adv.OpenProcessToken(k32.GetCurrentProcess(), 0x28, ctypes.byref(token)):
+        return False, "could not open process token"
+    try:
+        luid = LUID()
+        if not adv.LookupPrivilegeValueW(None, "SeProfileSingleProcessPrivilege", ctypes.byref(luid)):
+            return False, f"could not look up memory privilege (Windows error {k32.GetLastError()})"
+        tp = TOKEN_PRIVILEGES()
+        tp.PrivilegeCount = 1
+        tp.Privileges[0].Luid = luid
+        tp.Privileges[0].Attributes = 2
+        # AdjustTokenPrivileges may return success while not assigning the requested privilege.
+        k32.SetLastError(0)
+        if not adv.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None):
+            return False, f"could not adjust memory privilege (Windows error {k32.GetLastError()})"
+        if k32.GetLastError() == 1300:  # ERROR_NOT_ALL_ASSIGNED
+            return False, "this token does not have the required memory privilege"
+        for cmd in (3, 4):
+            c = ctypes.c_int(cmd)
+            status = nt.NtSetSystemInformation(80, ctypes.byref(c), ctypes.sizeof(c))
+            if status != 0:
+                return False, f"NtSetSystemInformation({cmd}) failed: 0x{status & 0xFFFFFFFF:08X}"
+        return True, "standby/cached RAM flush requested"
+    finally:
+        k32.CloseHandle(token)
+
+def kill_all_llama():
+    # Kept for manual use only. NOT called automatically on Start/Stop anymore (FIX 5).
+    for name in PROCESS_NAMES:
+        subprocess.run(["taskkill", "/F", "/T", "/IM", name],
+                       capture_output=True, creationflags=NO_WINDOW)
+
+class PMC(ctypes.Structure):
+    _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t)]
+
+_API = {}
+def _api():
+    if not _API:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ps = ctypes.WinDLL("psapi", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                   ctypes.POINTER(wintypes.DWORD)]
+        ps.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(PMC), wintypes.DWORD]
+        ps.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+        ps.EnumProcesses.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD,
+                                     ctypes.POINTER(wintypes.DWORD)]
+        _API["k32"], _API["ps"] = k32, ps
+    return _API["k32"], _API["ps"]
+
+_ACCESS = 0x1000 | 0x0400 | 0x0010 | 0x0100
+
+def _working_set(ps, h):
+    pmc = PMC()
+    pmc.cb = ctypes.sizeof(PMC)
+    if ps.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+        return pmc.WorkingSetSize
+    return 0
+
+def list_processes():
+    k32, ps = _api()
+    arr = (wintypes.DWORD * 4096)()
+    need = wintypes.DWORD()
+    ps.EnumProcesses(arr, ctypes.sizeof(arr), ctypes.byref(need))
+    n = need.value // ctypes.sizeof(wintypes.DWORD)
+    groups = {}
+    me = os.getpid()
+    for pid in arr[:n]:
+        if pid in (0, 4, me):
+            continue
+        h = k32.OpenProcess(_ACCESS, False, pid)
+        if not h:
+            continue
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if not k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                continue
+            name = os.path.basename(buf.value)
+            g = groups.setdefault(name, {"pids": [], "ws": 0})
+            g["pids"].append(pid)
+            g["ws"] += _working_set(ps, h)
+        finally:
+            k32.CloseHandle(h)
+    return groups
+
+def trim_pids(pids):
+    k32, ps = _api()
+    released, failed = 0, 0
+    for pid in pids:
+        h = k32.OpenProcess(_ACCESS, False, pid)
+        if not h:
+            failed += 1
+            continue
+        try:
+            before = _working_set(ps, h)
+            if ps.EmptyWorkingSet(h):
+                released += max(0, before - _working_set(ps, h))
+            else:
+                failed += 1
+        finally:
+            k32.CloseHandle(h)
+    return released, failed
+
+def process_memory(pid):
+    k32, ps = _api()
+    h = k32.OpenProcess(0x1000 | 0x0400 | 0x0010, False, pid)
+    if not h:
+        return None
+    try:
+        pmc = PMC()
+        pmc.cb = ctypes.sizeof(PMC)
+        if ps.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+            return pmc.WorkingSetSize, pmc.PagefileUsage
+    finally:
+        k32.CloseHandle(h)
+    return None
+
+_GGUF_SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
+_GGUF_CACHE = {}
+
+# FIX 2: only read keys we need, no fragile early-break on tokenizer order.
+_WANTED_SUFFIXES = (".block_count", ".embedding_length", ".attention.head_count",
+                    ".attention.head_count_kv", ".attention.key_length",
+                    ".attention.value_length", ".full_attention_interval",
+                    ".context_length", ".ssm.inner_size")
+_WANTED_EXACT = {"general.architecture", "general.size_label"}
+
+def read_gguf_info(path):
+    ck = (path, os.path.getmtime(path))
+    if ck in _GGUF_CACHE:
+        return _GGUF_CACHE[ck]
+    info = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        f.read(4)
+        _n_tensors, n_kv = struct.unpack("<QQ", f.read(16))
+        def rstr():
+            (n,) = struct.unpack("<Q", f.read(8))
+            return f.read(n).decode("utf-8", "replace")
+        def rval(t):
+            if t == 8:
+                return rstr()
+            if t == 9:
+                et, n = struct.unpack("<IQ", f.read(12))
+                if et in _GGUF_SCALAR:
+                    c = _GGUF_SCALAR[et]
+                    data = f.read(struct.calcsize(c) * n)
+                    return list(struct.unpack(f"<{n}{c}", data)) if n <= 1024 else None
+                for _ in range(n):
+                    rval(et)
+                return None
+            c = _GGUF_SCALAR[t]
+            return struct.unpack("<" + c, f.read(struct.calcsize(c)))[0]
+        for _ in range(n_kv):
+            k = rstr()
+            (t,) = struct.unpack("<I", f.read(4))
+            # Still must consume the value to keep file offset correct, even if not wanted.
+            v = rval(t)
+            if k in _WANTED_EXACT or any(k.endswith(s) for s in _WANTED_SUFFIXES):
+                info[k] = v
+            # Also keep arch early so suffix matching works - arch is in _WANTED_EXACT
+    info["arch"] = info.get("general.architecture")
+    _GGUF_CACHE[ck] = info
+    return info
+
+_BYTES_PER_ELEM = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32,
+                   "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
+
+def estimate_kv_mib(info, n_ctx, ctk, ctv):
+    arch = info.get("arch")
+    if not arch or not n_ctx:
+        return None
+    def g(k):
+        return info.get(f"{arch}.{k}")
+    n_layer, n_embd = g("block_count"), g("embedding_length")
+    n_head, n_kv = g("attention.head_count"), g("attention.head_count_kv")
+    if not n_layer or not n_embd:
+        return None
+    if n_kv is None:
+        n_kv = n_head
+    if n_kv is None:
+        return None
+    kv_heads = list(n_kv) if isinstance(n_kv, list) else [n_kv] * n_layer
+    if len(kv_heads) != n_layer:
+        return None
+    interval = g("full_attention_interval")
+    if isinstance(interval, int) and interval > 1:
+        kv_heads = [h if (i + 1) % interval == 0 else 0 for i, h in enumerate(kv_heads)]
+    head_ref = max(n_head) if isinstance(n_head, list) else n_head
+    key_len = g("attention.key_length") or (n_embd // head_ref if head_ref else None)
+    if not key_len:
+        return None
+    val_len = g("attention.value_length") or key_len
+    bk, bv = _BYTES_PER_ELEM.get(ctk, 2.0), _BYTES_PER_ELEM.get(ctv, 2.0)
+    return sum(kv_heads) * n_ctx * (key_len * bk + val_len * bv) / 1024**2
+
+def fmt_mib(mib):
+    return f"{mib:,.0f} MiB ({mib / 1024:.2f} GB)"
+
+# ----------------------------------------------------------------------------
+# AUTO NGL. START does the work:
+#   no saved value    -> trial loop (real load + real generation with a long prompt), save, start
+#   saved value       -> start at once with it
+#   OOM in real use   -> drop to the next lower value, save, restart
+# ----------------------------------------------------------------------------
+AUTO_NGL_FILE = os.path.join(BASE_DIR, "auto_ngl.json")
+AUTO_CANDIDATES = [32, 16, 8, 4, 0]     # descending; only values <= the real layer count are used
+AUTO_OOM_WORDS = ("outofdevicememory", "outofhostmemory", "decode() failed", "failed to allocate", "ggml_assert")
+AUTO_LOAD_TIMEOUT = 240                 # seconds for /health to answer
+AUTO_TEST_TIMEOUT = 600                 # seconds for the generation test (slow at low ngl)
+
+
+def _base(path):
+    """File name from a Windows or POSIX path, on any OS."""
+    return re.split(r"[\\/]", path)[-1]
+
+
+def _port_listening(port):
+    """True if something accepts connections on 127.0.0.1:port. Works the same on Windows and Linux
+    (a bind() test does not: SO_REUSEADDR and TIME_WAIT make it unreliable)."""
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sk:
+        sk.settimeout(1)
+        return sk.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _is_oom_line(line):
+    low = line.lower()
+    if "pinned memory" in low:          # a warning real loads print and survive, not a failure
+        return False
+    return any(w in low for w in AUTO_OOM_WORDS)
+
+
+def _first_oom(lines):
+    for line in lines:
+        if _is_oom_line(line):
+            return line.strip()
+    return None
+
+
+def _auto_applies(p):
+    """Only stock-compatible llama-server presets with -ngl. Bonsai needs PrismML, so it is excluded."""
+    if p["exe"] != "llama-server.exe" or "-ngl" not in p["args"] or "-m" not in p["args"]:
+        return False
+    model = _base(p["args"][p["args"].index("-m") + 1])
+    return not model.lower().startswith("ternary-bonsai")
+
+
+def _auto_key(p):
+    """Model file + size + mtime + ctx + KV type + batch sizes + mmproj. A reconverted file gets a new key.
+    -ngl is not part of the key: it is the value being tuned."""
+    if not _auto_applies(p):
+        return None
+    a = p["args"]
+
+    def val(flag):
+        return a[a.index(flag) + 1] if flag in a else None
+
+    rel = val("-m")
+    try:
+        st = os.stat(os.path.join(BASE_DIR, rel))
+    except OSError:
+        return None
+    mm = None
+    if val("--mmproj"):
+        try:
+            ms = os.stat(os.path.join(BASE_DIR, val("--mmproj")))
+            mm = [ms.st_size, int(ms.st_mtime)]
+        except OSError:
+            mm = ["missing"]
+    blob = json.dumps({"model": _base(rel), "size": st.st_size, "mtime": int(st.st_mtime),
+                       "mmproj": mm, "ctx": val("-c"), "ctk": val("-ctk"), "ctv": val("-ctv"),
+                       "fa": val("-fa"), "b": val("-b"), "ub": val("-ub")}, sort_keys=True)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def load_auto_ngl():
+    try:
+        with open(AUTO_NGL_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_auto_ngl(data):
+    tmp = AUTO_NGL_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, AUTO_NGL_FILE)
+
+
+AUTO_CACHE = load_auto_ngl()
+
+
+def _auto_record(p):
+    key = _auto_key(p)
+    return AUTO_CACHE.get(key) if key else None
+
+
+def _auto_layers(p):
+    path = os.path.join(BASE_DIR, p["args"][p["args"].index("-m") + 1])
+    info = read_gguf_info(path)
+    arch = info.get("arch")
+    n = info.get(f"{arch}.block_count") if arch else None
+    return int(n) if isinstance(n, int) else None
+
+
+def _auto_trials(layers):
+    """99 = all layers (output layer included), then descending unique values <= the real layer count.
+    36 layers -> 99, 36, 32, 16, 8, 4, 0.   28 layers -> 99, 28, 16, 8, 4, 0.   unknown -> 99, 32, 16, 8, 4, 0."""
+    vals = {v for v in AUTO_CANDIDATES if layers is None or v <= layers}
+    if layers:
+        vals.add(layers)
+    return [99] + sorted(vals, reverse=True)
+
+
+def _http_json(url, body=None, timeout=5):
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, json.loads(r.read().decode("utf-8", "replace") or "{}")
+
+
+def _test_prompt(ctx_tokens):
+    """About 75% of the context (capped): the decode path is exercised, not just a short ping."""
+    target = max(256, min(int(ctx_tokens * 0.75), 2500))
+    return "The quick brown fox jumps over the lazy dog. " * (target // 10 + 1) + "Reply with the single word OK."
+
+
+def _auto_try(p, port, ngl, cancel):
+    """One trial. Returns (status, detail, meta); status is 'ok', 'oom', 'other' or 'cancelled'."""
+    exe = os.path.join(BASE_DIR, p["exe"])
+    args = list(p["args"])
+    args[args.index("-ngl") + 1] = str(ngl)
+    ctx_tokens = int(args[args.index("-c") + 1]) if "-c" in args else 4096
+    cmd = [exe] + args + ["--port", str(port)] + EXTRA_SERVER_ARGS
+    lines = []
+
+    def reader(proc):
+        for line in proc.stdout:
+            lines.append(line.rstrip("\n"))
+
+    kill_all_llama()        # a trial must not share the port with another server
+    t_free = time.time()
+    while _port_listening(port):                 # give the previous trial's server time to let go
+        if time.time() - t_free > 15:
+            return "other", f"port {port} is already in use by another program; close it or change the port", {}
+        if cancel.is_set():
+            return "cancelled", "", {}
+        time.sleep(0.5)
+    proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    threading.Thread(target=reader, args=(proc,), daemon=True).start()
+    try:
+        # 1) load: wait for /health; an OOM line or an early exit ends the trial at once
+        t0 = time.time()
+        while True:
+            if cancel.is_set():
+                return "cancelled", "", {}
+            hit = _first_oom(lines)
+            if hit:
+                return "oom", hit, {}
+            if proc.poll() is not None:
+                return "other", f"server exited (code {proc.returncode}): {lines[-1] if lines else 'no output'}", {}
+            try:
+                st, _ = _http_json(f"http://127.0.0.1:{port}/health", timeout=2)
+                if st == 200:
+                    break
+            except Exception:
+                pass
+            if time.time() - t0 > AUTO_LOAD_TIMEOUT:
+                return "other", "timed out loading", {}
+            time.sleep(0.5)
+        load_s = round(time.time() - t0, 1)
+
+        # 2) generation with a long prompt: this is where the decode OOM showed up
+        mark = len(lines)
+        body = {"messages": [{"role": "user", "content": _test_prompt(ctx_tokens)}],
+                "max_tokens": 32, "temperature": 0, "stream": False}
+        try:
+            _, res = _http_json(f"http://127.0.0.1:{port}/v1/chat/completions", body, timeout=AUTO_TEST_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            # The server prints the OOM line, then answers 500. The reader thread may not have read that
+            # line yet, so give the log a few seconds to catch up, and also check the response body.
+            body = e.read()[:400].decode("utf-8", "replace")
+            hit = _first_oom(lines[mark:]) or (body if any(w in body.lower() for w in AUTO_OOM_WORDS) else None)
+            t_wait = time.time()
+            while not hit and time.time() - t_wait < 3:
+                time.sleep(0.1)
+                hit = _first_oom(lines[mark:])
+            if hit:
+                return "oom", hit, {}
+            return "other", f"HTTP {e.code} during generation: {body[:160]!r}", {}
+        except Exception as e:
+            if cancel.is_set():
+                return "cancelled", "", {}
+            return "other", f"generation failed: {e}", {}
+        hit = _first_oom(lines[mark:])
+        if hit:
+            return "oom", hit, {}
+        usage = res.get("usage", {}) if isinstance(res, dict) else {}
+        if usage.get("completion_tokens", 0) < 1:
+            return "other", f"no tokens generated: {str(res)[:120]}", {}
+        return "ok", "ok", {"prompt_tokens": usage.get("prompt_tokens"),
+                            "completion_tokens": usage.get("completion_tokens"), "load_s": load_s}
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+
+
+def auto_tune_ngl(p, port, out, cancel):
+    """Worker thread (no Tk calls). Puts ('log', text), then exactly one of
+    ('done', ngl, meta), ('failed', reason) or ('cancelled', None)."""
+    try:
+        try:
+            layers = _auto_layers(p)
+            note = ""
+        except Exception as e:                  # unreadable header: still tune, with the unknown-layer list
+            layers, note = None, f" (could not read the layer count: {e})"
+        trials = _auto_trials(layers)
+        out.put(("log", f"[auto ngl] {p['name']}: layers={layers}{note}, trying -ngl {trials}"))
+        for ngl in trials:
+            if cancel.is_set():
+                out.put(("cancelled", None))
+                return
+            out.put(("log", f"[auto ngl] trying -ngl {ngl} ..."))
+            status, detail, meta = _auto_try(p, port, ngl, cancel)
+            if status == "cancelled":
+                out.put(("cancelled", None))
+                return
+            if status == "ok":
+                meta["layers"] = layers
+                out.put(("done", ngl, meta))
+                return
+            if status == "other":
+                out.put(("failed", f"not an out-of-memory error, so a lower -ngl will not help: {detail}"))
+                return
+            out.put(("log", f"[auto ngl]   -ngl {ngl}: out of memory: {detail[:200]}"))
+        out.put(("failed", f"out of memory at every -ngl in {trials}: free RAM is too low for this model at this context"))
+    except Exception as e:
+        out.put(("failed", f"internal error: {e}"))
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Llama Launcher")
+        self.geometry("940x800")
+        self.minsize(700, 480)
+        self.proc = None
+        self.gen = 0
+        self.q = queue.Queue()
+        self._reset_mem()
+        self.mem_est = {}
+        self.gpu_mem = None
+        self._gpu_warned = False
+        self.tuning = False
+        self.auto_preset = None
+        self.auto_cancel = None
+        self.auto_q = None
+        self.run_auto = False        # the running server is subject to auto-tuning (OOM -> drop)
+        self.run_preset = None
+        self.run_ngl = None
+        self.oom_pending = False
+        # Opt-in: broad cleanup can cause other applications to page data back in.
+        self.auto_clear = tk.BooleanVar(value=False)
+        self.port = tk.StringVar(value=DEFAULT_PORT)
+        self.choice = tk.StringVar(value=PRESETS[0]["name"])
+        self._build_ui()
+        self._set_status("Stopped", "#888888")
+        for notice in STARTUP_NOTICES:
+            self._log(notice)
+        if not os.path.isfile(os.path.join(BASE_DIR, "llama-server.exe")):
+            self._log(f"[presets] llama-server.exe is missing from {BASE_DIR} - every preset will fail to start.")
+        for name, miss in MISSING_FILES.items():
+            others = [n for n in miss if n != "llama-server.exe"]
+            if others:
+                self._log(f"[presets] missing in {BASE_DIR}: {', '.join(others)}   ->   {name}")
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        threading.Thread(target=self._gpu_loop, daemon=True).start()
+        self.after(100, self._drain)
+        self.after(1000, self._tick)
+
+    def _build_ui(self):
+        pad = {"padx": 10, "pady": 6}
+        top = ttk.Frame(self)
+        top.pack(fill="x", **pad)
+        ttk.Label(top, text="Model preset:").pack(side="left")
+        self.combo = ttk.Combobox(top, textvariable=self.choice, state="readonly",
+                                  values=[p["name"] for p in PRESETS], width=55,
+                                  height=len(PRESETS))  # show every preset without scrolling
+        self.combo.pack(side="left", padx=8, fill="x", expand=True)
+        self.combo.bind("<<ComboboxSelected>>", lambda e: self._update_cmd())
+        ttk.Label(top, text="Port:").pack(side="left", padx=(8, 2))
+        port = ttk.Entry(top, textvariable=self.port, width=6)
+        port.pack(side="left")
+        port.bind("<KeyRelease>", lambda e: self._update_cmd())
+        self.cmd_label = ttk.Label(self, text="", foreground="#666", wraplength=860, justify="left")
+        self.cmd_label.pack(fill="x", padx=10)
+        btns = ttk.Frame(self)
+        btns.pack(fill="x", **pad)
+        style = ttk.Style()
+        style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
+        self.start_btn = ttk.Button(btns, text="▶  START", style="Big.TButton", command=self.start)
+        self.start_btn.pack(side="left", padx=(0, 6))
+        self.stop_btn = ttk.Button(btns, text="■  STOP", style="Big.TButton", command=self.stop)
+        self.stop_btn.pack(side="left", padx=6)
+        ttk.Button(btns, text="⟳  RESTART", style="Big.TButton", command=self.start).pack(side="left", padx=6)
+        ttk.Button(btns, text="🧹  FLUSH FILE CACHE", style="Big.TButton", command=self.clear_ram).pack(side="left", padx=6)
+        ttk.Button(btns, text="📋  CLEANER…", style="Big.TButton", command=self.open_cleaner).pack(side="left", padx=6)
+        opts = ttk.Frame(self)
+        opts.pack(fill="x", padx=10)
+        ttk.Checkbutton(opts, text="Auto-flush Windows file cache after Stop (opt-in)", variable=self.auto_clear).pack(side="left")
+        if not is_admin():
+            ttk.Button(opts, text="Restart as Admin (enables full RAM flush)", command=self._relaunch_admin).pack(side="right")
+        else:
+            ttk.Label(opts, text="Running as admin ✔", foreground="#2e8b57").pack(side="right")
+        stat = ttk.Frame(self)
+        stat.pack(fill="x", **pad)
+        self.status = tk.Label(stat, text="", fg="white", font=("Segoe UI", 10, "bold"), padx=12, pady=3)
+        self.status.pack(side="left")
+        self.ram_label = ttk.Label(stat, text="")
+        self.ram_label.pack(side="left", padx=14)
+        self.vram_label = ttk.Label(stat, text="")
+        self.vram_label.pack(side="left")
+        ttk.Button(stat, text="Clear log", command=lambda: self.log.delete("1.0", "end")).pack(side="right")
+        self.copy_btn = ttk.Button(stat, text="Copy log", command=self._copy_log)
+        self.copy_btn.pack(side="right", padx=(0, 6))
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        logf = ttk.Frame(self.nb)
+        memf = ttk.Frame(self.nb)
+        self.nb.add(logf, text="  Log  ")
+        self.nb.add(memf, text="  Memory breakdown  ")
+        self._build_mem_tab(memf)
+        self.log = tk.Text(logf, bg="#111", fg="#ddd", font=("Consolas", 9), wrap="none", insertbackground="white")
+        sb = ttk.Scrollbar(logf, command=self.log.yview)
+        self.log.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
+        self._update_cmd()
+
+    def _copy_log(self):
+        self.clipboard_clear()
+        self.clipboard_append(self.log.get("1.0", "end-1c"))
+        self.update()
+        self.copy_btn.config(text="Copied ✓")
+        self.after(1500, lambda: self.copy_btn.config(text="Copy log"))
+
+    def _reset_mem(self):
+        self.mem = {k: {} for k in ("model", "kv", "rs", "compute", "output")}
+        self.mem_cache = None
+        self.mem_fail = ""
+        self.mem_ready = False
+        self.mem_busy = False
+        self.mem_base_cpu = None
+
+    def _parse_mem(self, line):
+        m = MEM_RE.search(line)
+        if m:
+            dev, key, mib = m.group(1), m.group(2).lower(), float(m.group(3))
+            d = self.mem[key]
+            if key in ("model", "kv", "rs"):
+                d[dev] = d.get(dev, 0) + mib
+            else:
+                d[dev] = mib
+            return
+        c = CACHE_RE.search(line)
+        if c:
+            self.mem_cache = float(c.group(2))
+            return
+        f = FAIL_MIB_RE.search(line)
+        if f:
+            # llama.cpp already reports MiB here - do not divide again.
+            self.mem_fail = (f"Last failed allocation: {float(f.group(2)):,.0f} MiB on {f.group(1)} - out of "
+                             f"memory. Lower -c, lower -b/-ub, or offload fewer layers (-ngl).")
+            return
+        fr = FAIL_RAW_RE.search(line.rstrip())
+        if fr:
+            self.mem_fail = (f"Last failed allocation: {int(fr.group(2)) / 1024**2:,.0f} MiB on {fr.group(1)} - out of "
+                             f"memory. Lower -c, lower -b/-ub, or offload fewer layers (-ngl).")
+            return
+        fb = FAIL_BUF_RE.search(line)
+        if fb:
+            self.mem_fail = (f"Last failed allocation: {fb.group(1)} - out of memory. "
+                             f"Lower -c, lower -b/-ub, or offload fewer layers (-ngl).")
+            return
+        fy = FAIL_BYTES_RE.search(line)
+        if fy:
+            self.mem_fail = (f"Last failed allocation: {int(fy.group(1)) / 1024**2:,.0f} MiB staging buffer - out of "
+                             f"memory. Lower -c, lower -b/-ub, or offload fewer layers (-ngl).")
+
+    def _build_mem_tab(self, parent):
+        canvas = tk.Canvas(parent, highlightthickness=0)
+        vbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = ttk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+
+        def _mem_wheel(event):
+            # Mouse wheel scrolls this tab only when the pointer is over it (labels included).
+            w = canvas.winfo_containing(event.x_root, event.y_root)
+            while w is not None:
+                if w is canvas:
+                    canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                    return
+                w = w.master
+        self._mem_wheel = _mem_wheel
+        self.bind_all("<MouseWheel>", _mem_wheel, add="+")
+
+        self.mem_info = ttk.Label(inner, text="", font=("Segoe UI", 9, "bold"), wraplength=820, justify="left")
+        self.mem_info.pack(fill="x", padx=8, pady=(8, 0))
+        self.mem_canvas = tk.Canvas(inner, height=34, bg="#eeeeee", highlightthickness=1, highlightbackground="#bbbbbb")
+        self.mem_canvas.pack(fill="x", padx=8, pady=(10, 4))
+        self.mem_canvas.bind("<Configure>", lambda e: self._refresh_mem())
+        self.mem_note = ttk.Label(inner, text="", foreground="#b03030", wraplength=820, justify="left")
+        self.mem_note.pack(fill="x", padx=8)
+        grid = ttk.Frame(inner)
+        grid.pack(fill="x", padx=8, pady=6)
+        grid.columnconfigure(1, weight=0, minsize=140)
+        grid.columnconfigure(2, weight=0, minsize=190)
+        grid.columnconfigure(3, weight=1)
+        self.mem_rows = {}
+        for i, (key, name, color, desc) in enumerate(COMPONENTS):
+            tk.Label(grid, bg=color, width=2).grid(row=i, column=0, padx=(0, 6), pady=3, sticky="nw")
+            ttk.Label(grid, text=name, font=("Segoe UI", 9, "bold"), wraplength=140).grid(row=i, column=1, sticky="nw", padx=(0, 10))
+            size = ttk.Label(grid, text="—", justify="left", wraplength=190)
+            size.grid(row=i, column=2, sticky="nw", padx=(0, 10))
+            desc_label = ttk.Label(grid, text=desc, wraplength=380, foreground="#555", justify="left")
+            desc_label.grid(row=i, column=3, sticky="nw")
+            self.mem_rows[key] = size
+            if not hasattr(self, "mem_desc"):
+                self.mem_desc = {}
+            self.mem_desc[key] = desc_label
+        ttk.Separator(inner).pack(fill="x", padx=8, pady=4)
+        self.mem_totals = ttk.Label(inner, text="", font=("Consolas", 10), justify="left")
+        self.mem_totals.pack(anchor="w", padx=8)
+        self.mem_hint = ttk.Label(inner, text="", foreground="#555", wraplength=820, justify="left")
+        self.mem_hint.pack(fill="x", padx=8, pady=(6, 12))
+        self._refresh_mem()
+
+    def _load_model_info(self):
+        """Weights = file size (read first). KV and layer info = GGUF header (may fail on its own)."""
+        est = {}
+        try:
+            cmd = self._build_cmd()
+
+            def val(flag, default=None):
+                return cmd[cmd.index(flag) + 1] if flag in cmd else default
+
+            model_arg = val("-m")
+            est["for"] = model_arg                      # which model this info belongs to
+            est["file"] = _base(model_arg)
+            mpath = os.path.join(BASE_DIR, est["file"])
+            est["model_mib"] = os.path.getsize(mpath) / 1024**2
+            mm = val("--mmproj")
+            if mm:
+                est["mmproj_mib"] = os.path.getsize(os.path.join(BASE_DIR, _base(mm))) / 1024**2
+        except Exception as e:
+            est["error"] = f"{type(e).__name__}: {e} (looking in {BASE_DIR})"
+            self.mem_est = est
+            return
+        try:
+            info = read_gguf_info(mpath)
+            est["info"] = info
+            n_ctx = int(val("-c", 0))
+            if n_ctx:
+                est["kv_mib"] = estimate_kv_mib(info, n_ctx, val("-ctk", "f16"), val("-ctv", "f16"))
+        except Exception as e:
+            est["header_error"] = f"{type(e).__name__}: {e}"
+        self.mem_est = est
+
+    def _gpu_loop(self):
+        # FIX 1: guarded typeperf parsing, log once on failure, never crash silently.
+        while True:
+            res = None
+            p = self.proc
+            if p and p.poll() is None:
+                try:
+                    pid = p.pid
+                    out = subprocess.run(
+                        ["typeperf", "-sc", "1",
+                         rf"\GPU Process Memory(pid_{pid}*)\Dedicated Usage",
+                         rf"\GPU Process Memory(pid_{pid}*)\Shared Usage"],
+                        capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW).stdout
+                    rows = [r for r in csv.reader(out.splitlines()) if r]
+                    hi = None
+                    for i, r in enumerate(rows):
+                        if r and r[0].startswith("(PDH-CSV"):
+                            hi = i
+                            break
+                    if hi is None or hi + 1 >= len(rows):
+                        raise ValueError("typeperf returned no data rows")
+                    ded = sh = 0.0
+                    for h, v in zip(rows[hi][1:], rows[hi + 1][1:]):
+                        try:
+                            x = float(v)
+                        except ValueError:
+                            continue
+                        if "Dedicated Usage" in h:
+                            ded += x
+                        elif "Shared Usage" in h:
+                            sh += x
+                    res = (ded / 1024**2, sh / 1024**2)
+                    self._gpu_warned = False
+                except Exception as e:
+                    res = None
+                    if not self._gpu_warned:
+                        self._gpu_warned = True
+                        try:
+                            self.q.put((self.gen, "line", f"[gpu] typeperf failed, GPU RAM will show blank: {e}"))
+                        except Exception:
+                            pass
+            self.gpu_mem = res
+            time.sleep(1)
+
+    def _model_desc_text(self, est, cmd):
+        file_part = f"{est['file']}: {est['model_mib'] / 1024:.2f} GB on disk"
+        if "mmproj_mib" in est:
+            file_part += f" + picture part {est['mmproj_mib'] / 1024:.2f} GB"
+        ngl = None
+        try:
+            if cmd and "-ngl" in cmd:
+                ngl = int(cmd[cmd.index("-ngl") + 1])
+        except (ValueError, IndexError):
+            ngl = None
+        info = est.get("info", {}) or {}
+        arch = info.get("arch") or ""
+        layers = info.get(f"{arch}.block_count") if arch else None
+        if not isinstance(layers, int):
+            layers = None
+        running = bool(getattr(self, "proc", None) and self.proc.poll() is None)
+        split = dict(getattr(self, "mem", {}).get("model", {}) or {})
+        total = sum(split.values()) if split else 0.0
+        meas = "Measured" if running else "Measured (last run)"
+        if total > 0:
+            cpu = sum(v for k, v in split.items() if str(k).upper().startswith("CPU"))
+            gpu = total - cpu
+            gpu_pct = 100.0 * gpu / total
+            if gpu_pct >= 99:
+                return f"{file_part}. {meas}. All on graphics chip."
+            if gpu_pct <= 0:
+                return f"{file_part}. {meas}. All on processor. It will be slow."
+            if ngl is not None and layers is not None and ngl >= layers + 1:
+                return (f"{file_part}. {meas}. {gpu_pct:.0f}% on graphics, {100.0 - gpu_pct:.0f}% on processor. "
+                        f"Preset asks for all parts on graphics. So this much on processor means graphics ran short.")
+            if ngl is not None and layers is not None:
+                return (f"{file_part}. {meas}. {gpu_pct:.0f}% on graphics, {100.0 - gpu_pct:.0f}% on processor. "
+                        f"Preset puts -ngl {ngl} of {layers} parts on graphics. Rest on processor is normal.")
+            return f"{file_part}. {meas}. {gpu_pct:.0f}% on graphics, {100.0 - gpu_pct:.0f}% on processor."
+        if running:
+            return f"{file_part}. Running. Waiting for real numbers."
+        if ngl is not None and layers is not None:
+            return f"{file_part}. Not started. Preset puts -ngl {ngl} of {layers} parts on graphics. Start to see real numbers."
+        return f"{file_part}. Not started. Start to see real numbers."
+
+    def _kv_desc_text(self, est, cmd):
+        n_ctx = None
+        try:
+            if cmd and "-c" in cmd:
+                n_ctx = int(cmd[cmd.index("-c") + 1])
+        except (ValueError, IndexError):
+            n_ctx = None
+        actual = sum((self.mem.get("kv", {}) or {}).values())
+        info = est.get("info", {}) or {}
+        arch = info.get("arch") or ""
+        is_hybrid = info.get(f"{arch}.full_attention_interval") is not None if arch else False
+        base = "Memory for this chat. It remembers what you said."
+        if n_ctx:
+            base += f" Preset sets -c {n_ctx}, about {int(n_ctx * 0.75):,} words."
+        if actual > 0:
+            base += f" Measured {actual:,.0f} MB now. It grows as the chat grows."
+        elif est.get("kv_mib"):
+            base += f" About {est['kv_mib']:,.0f} MB when the chat is full. It grows as the chat grows."
+        if is_hybrid:
+            base += " This model uses it in only some parts, so this is at most the real size."
+        return base
+
+    def _rs_desc_text(self, est):
+        info = est.get("info", {}) or {}
+        arch = info.get("arch") or ""
+        is_hybrid = False
+        if arch:
+            is_hybrid = any(str(k).startswith(f"{arch}.ssm.") or k == f"{arch}.full_attention_interval" for k in info)
+        if not is_hybrid:
+            return "Not used by this model. Only some models need it."
+        actual = sum((self.mem.get("rs", {}) or {}).values())
+        base = "Fixed amount. It does not grow when the chat grows."
+        if actual > 0:
+            base += f" Measured {actual:,.0f} MB."
+        else:
+            base += " Not shown separately. It is inside the graphics total."
+        return base
+
+    def _compute_desc_text(self, cmd):
+        b = ub = None
+        try:
+            if cmd and "-b" in cmd:
+                b = int(cmd[cmd.index("-b") + 1])
+            if cmd and "-ub" in cmd:
+                ub = int(cmd[cmd.index("-ub") + 1])
+        except (ValueError, IndexError):
+            pass
+        actual = sum((self.mem.get("compute", {}) or {}).values())
+        base = "Rough work for reading your question."
+        if b is not None and ub is not None:
+            base += f" Preset sets -b {b}: it reads {b} word pieces at one time."
+            base += f" Preset sets -ub {ub}: it works in groups of {ub}."
+        base += " Bigger is faster but needs more memory. It is biggest when the question is long."
+        if actual > 0:
+            base += f" Measured about {actual:,.0f} MB."
+        return base
+
+    def _output_desc_text(self):
+        actual = sum((self.mem.get("output", {}) or {}).values())
+        base = ("Marks for the next word. The model gives a mark to every word and picks the one with most marks. "
+                "Very small, under 1 MB. It is automatic. You do not set it.")
+        if actual > 0:
+            base += f" Measured {actual:.0f} MB."
+        return base
+
+    def _prompt_cache_desc_text(self, cache_ram):
+        return (f"Saved work from old questions. If you ask the same thing again, it uses the saved work, so it is faster. "
+                f"Preset allows {cache_ram} MB for this. When it is full, old saved work is removed. "
+                f"So memory grows while you chat.")
+
+    def _other_desc_text(self):
+        return "Memory the app needs for itself. It is not for the model and not for the chat. It stays the same after start."
+
+    def _refresh_mem(self):
+        mem = self.mem
+        try:
+            cmd = self._build_cmd()
+            cache_ram = int(cmd[cmd.index("--cache-ram") + 1]) if "--cache-ram" in cmd else 2048
+        except Exception:
+            cmd, cache_ram = [], 2048
+        want = cmd[cmd.index("-m") + 1] if "-m" in cmd else None
+        if want and self.mem_est.get("for") != want:    # info is missing or belongs to another model: reload
+            self._load_model_info()
+        est = self.mem_est
+        if "model_mib" in est:
+            if hasattr(self, "mem_desc") and "model" in self.mem_desc:
+                self.mem_desc["model"].config(text=self._model_desc_text(est, cmd))
+        if hasattr(self, "mem_desc"):
+            wiring = {
+                "kv": lambda: self._kv_desc_text(est, cmd),
+                "rs": lambda: self._rs_desc_text(est),
+                "compute": lambda: self._compute_desc_text(cmd),
+                "output": lambda: self._output_desc_text(),
+                "cache": lambda: self._prompt_cache_desc_text(cache_ram),
+                "other": lambda: self._other_desc_text(),
+            }
+            for key, make in wiring.items():
+                if key in self.mem_desc:
+                    self.mem_desc[key].config(text=make())
+        if "model_mib" not in est:
+            sel = self.choice.get() if hasattr(self, "choice") else ""
+            if MISSING_FILES.get(sel):
+                self.mem_info.config(text=f"⚠ MISSING in {BASE_DIR}: {', '.join(MISSING_FILES[sel])} - "
+                                          f"this preset will fail to start.")
+            else:
+                self.mem_info.config(text=f"Model file not readable: {est.get('error', 'unknown error')}")
+        else:
+            head = f"{est['file']}: {est['model_mib'] / 1024:.2f} GB on disk"
+            if "mmproj_mib" in est:
+                head += f"  + mmproj {est['mmproj_mib'] / 1024:.2f} GB"
+            info = est.get("info", {})
+            arch = info.get("arch")
+            bits = []
+            if est.get("header_error"):
+                bits.append(f"GGUF header not readable: {est['header_error']}")
+            if arch:
+                bits.append(f"arch {arch}")
+            if info.get("general.size_label"):
+                bits.append(str(info["general.size_label"]))
+            if info.get(f"{arch}.block_count"):
+                bits.append(f"{info[f'{arch}.block_count']} layers")
+            if isinstance(info.get(f"{arch}.context_length"), int):
+                bits.append(f"trained ctx {info[f'{arch}.context_length']:,}")
+            try:
+                preset_ctx = int(cmd[cmd.index("-c") + 1]) if "-c" in cmd else None
+                trained = info.get(f"{arch}.context_length") if arch else None
+                if preset_ctx and isinstance(trained, int):
+                    if preset_ctx > trained:
+                        bits.append(f"preset -c {preset_ctx:,} is above the trained {trained:,}: quality may drop past it")
+                    else:
+                        bits.append(f"preset uses -c {preset_ctx:,} of the trained {trained:,}")
+            except (ValueError, IndexError):
+                pass
+            # FIX 4: show missing-file warning in header, don't hide preset
+            sel = self.choice.get() if hasattr(self, "choice") else ""
+            if sel in MISSING_FILES and MISSING_FILES[sel]:
+                head += f"\n⚠ MISSING in {BASE_DIR}: {', '.join(MISSING_FILES[sel])} - this preset will fail to start."
+            self.mem_info.config(text=head + ("\n" + "  |  ".join(bits) if bits else ""))
+        best, text = {}, {}
+        for key in ("model", "kv", "rs", "compute", "output"):
+            if mem[key]:
+                best[key] = sum(mem[key].values())
+                text[key] = "\n".join(f"{dev}: {fmt_mib(v)}" for dev, v in mem[key].items())
+        if "model" not in best and "model_mib" in est:
+            v = est["model_mib"] + est.get("mmproj_mib", 0)
+            best["model"] = v
+            text["model"] = fmt_mib(v) + "\n(file size" + (" incl. mmproj)" if "mmproj_mib" in est else ")")
+        if "kv" not in best and est.get("kv_mib"):
+            best["kv"] = est["kv_mib"]
+            text["kv"] = fmt_mib(est["kv_mib"]) + "\n(estimate)"
+        if self.mem_cache is not None:
+            best["cache"] = self.mem_cache
+            text["cache"] = fmt_mib(self.mem_cache)
+        running = bool(self.proc and self.proc.poll() is None)
+        pm = process_memory(self.proc.pid) if running else None
+        ws = pm[0] / 1024**2 if pm else 0.0
+        priv = pm[1] / 1024**2 if pm else 0.0
+        gpu = self.gpu_mem if running else None
+        gsh = gpu[1] if gpu and priv >= gpu[1] else 0.0
+        gtot = gpu[0] + gpu[1] if gpu else None
+        cpu_side = max(0.0, priv - gsh)
+        if pm and gpu and self.mem_ready and not self.mem_busy and self.mem_base_cpu is None:
+            self.mem_base_cpu = cpu_side                   # baseline: loaded, GPU counters known, no request yet
+        notes = []
+        if self.mem_fail:
+            notes.append(self.mem_fail)
+        if pm and gtot is not None and "compute" not in best and "model" in best:
+            left = gtot - best.get("model", 0) - best.get("kv", 0)
+            if left >= 0:
+                best["compute"] = left
+                text["compute"] = f"≈ {fmt_mib(left)}\n(GPU - weights - KV)"
+            else:
+                notes.append(f"GPU memory ({fmt_mib(gtot)}) is smaller than weights + KV: part of the model is "
+                             f"probably running on the CPU.")
+        if pm and "cache" not in best and self.mem_base_cpu is not None:
+            g = max(0.0, cpu_side - self.mem_base_cpu)
+            best["cache"] = g
+            text["cache"] = f"{fmt_mib(g)}\n(RAM growth)"
+        if pm:
+            host = self.mem_base_cpu if self.mem_base_cpu is not None else cpu_side
+            best["other"] = host
+            text["other"] = fmt_mib(host) + ("\n(host RAM right after load)" if self.mem_base_cpu is not None else "")
+        info = est.get("info", {})
+        arch = info.get("arch")
+        hybrid = any(str(k).startswith(f"{arch}.ssm.") or k == f"{arch}.full_attention_interval" for k in info) if arch else False
+        dflt = "Not measured yet" if running else "Shows when the server is running"
+        text.setdefault("rs", ("Included in GPU total" if hybrid else "Not used"))
+        text.setdefault("output", "< 1 MiB, negligible")
+        for k in ("compute", "cache", "other"):
+            text.setdefault(k, dflt)
+        for key, _, _, _ in COMPONENTS:
+            self.mem_rows[key].config(text=text.get(key, "—"))
+        cpu_w = sum(v for dev, v in mem["model"].items() if dev.upper().startswith("CPU"))
+        if cpu_w > 500:
+            notes.append(f"{fmt_mib(cpu_w)} of model weights are on the CPU - generation will be slow.")
+        self.mem_note.config(text="  ".join(notes))
+        def m(v):
+            return f"{v:,.0f} MiB"
+        lines = [f"Weights + conversation memory : {m(best.get('model', 0) + best.get('kv', 0))}"]
+        if pm:
+            if gpu:
+                lines.append(f"GPU memory dedicated / shared: {m(gpu[0])} / {m(gpu[1])}  "
+                             f"(on an integrated GPU both come from system RAM)")
+            else:
+                lines.append("GPU memory                 : not available")
+            lines.append(f"Process RAM held by server : {m(priv)}   (working set {m(ws)})")
+            lines.append(f"Process RAM not on GPU     : {m(cpu_side)}")
+        else:
+            lines.append("Server memory             : not running")
+        self.mem_totals.config(text="\n".join(lines))
+        if not running:
+            hint = ("Server not running: weights show the file size, and conversation memory is an estimate "
+                    "for the selected preset. Start the server to see real numbers.")
+        elif not any(mem.values()):
+            hint = ("This build did not print buffer sizes. Weights are the file size. Chat memory is an estimate. "
+                    "Rough work is GPU memory minus weights and chat memory. Prompt cache is RAM growth since load.")
+        else:
+            hint = "Numbers from the log override the file-size and estimate values. Process and GPU numbers are live."
+        self.mem_hint.config(text=hint)
+        c = self.mem_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 100)
+        order = ("model", "kv", "rs", "compute", "output", "cache", "other")
+        total = sum(best.get(k, 0) for k in order)
+        if total <= 0:
+            c.create_text(w / 2, 17, text="Pick a preset to see its weights and KV estimate", fill="#777")
+            return
+        colors = {k: col for k, _, col, _ in COMPONENTS}
+        names = {k: n for k, n, _, _ in COMPONENTS}
+        x = 1
+        for k in order:
+            v = best.get(k, 0)
+            if v <= 0:
+                continue
+            seg = (w - 2) * v / total
+            c.create_rectangle(x, 1, x + seg, 34, fill=colors[k], outline="white")
+            if seg > 70:
+                c.create_text(x + seg / 2, 17, text=names[k], fill="white", font=("Segoe UI", 8, "bold"))
+            x += seg
+
+    # ---------------- AUTO NGL (driven by START) ----------------
+    def _begin_tuning(self, p):
+        try:
+            port = int(self.port.get().strip() or DEFAULT_PORT)
+            if not 1 <= port <= 65535:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid port", "Enter a TCP port number from 1 to 65535.")
+            return
+        self.tuning = True
+        self.auto_preset = p
+        self.auto_cancel = threading.Event()
+        self.auto_q = queue.Queue()
+        self._set_run_state("tuning")
+        self._set_status("Auto-tuning NGL…", "#d98c00")
+        self._log(f"\n=== Auto-tuning NGL for {p['name']} (port {port}): no saved value yet ===")
+        self._log("[auto ngl] each trial loads the model; big models take several minutes")
+        threading.Thread(target=auto_tune_ngl, args=(p, port, self.auto_q, self.auto_cancel), daemon=True).start()
+        self.after(200, self._poll_auto)
+
+    def _poll_auto(self):
+        finished = False
+        try:
+            while True:
+                item = self.auto_q.get_nowait()
+                if item[0] == "log":
+                    self._log(item[1])
+                    continue
+                finished = True
+                self._auto_finish(item)
+                break
+        except queue.Empty:
+            pass
+        if self.tuning and not finished:
+            self.after(200, self._poll_auto)
+
+    def _auto_finish(self, item):
+        self.tuning = False
+        kind = item[0]
+        p = self.auto_preset
+        if kind == "done":
+            ngl, meta = item[1], item[2]
+            saved = self._save_record(p, ngl, meta=meta)
+            self._log(f"[auto ngl] RESULT: -ngl {ngl} loads and answers a long prompt ({saved}). Starting…")
+            self.choice.set(p["name"])          # START must use the preset that was tuned
+            self._update_cmd()
+            self._set_status("Stopped", "#888888")
+            self._set_run_state("stopped")
+            self.start()                        # the saved value is used from here on
+            return
+        if kind == "failed":
+            self._log(f"[auto ngl] FAILED: {item[1]}")
+            messagebox.showerror("Auto-tuning NGL failed", item[1])
+        else:
+            self._log("[auto ngl] cancelled; nothing saved")
+        self._set_status("Stopped", "#888888")
+        self._set_run_state("stopped")
+        self._update_cmd()
+
+    def _save_record(self, p, ngl, meta=None, note=None):
+        key = _auto_key(p)
+        rec = {"model": _base(p["args"][p["args"].index("-m") + 1]), "ngl": ngl,
+               "tested_at": time.strftime("%Y-%m-%d %H:%M"), **(meta or {})}
+        if note:
+            rec["note"] = note
+        AUTO_CACHE[key] = rec
+        try:
+            save_auto_ngl(AUTO_CACHE)
+            return f"saved to {AUTO_NGL_FILE}"
+        except Exception as e:
+            return f"NOT saved ({e}); used for this session only"
+
+    def _schedule_oom(self, gen):
+        if self.oom_pending:
+            return
+        self.oom_pending = True
+        self.after(50, lambda: self._on_oom(gen))
+
+    def _on_oom(self, gen):
+        """An out-of-memory line came from the server that START launched: drop to the next lower value."""
+        self.oom_pending = False
+        if gen != self.gen or not self.run_auto or self.tuning:
+            return
+        p, cur = self.run_preset, self.run_ngl
+        try:
+            lower = [v for v in _auto_trials(_auto_layers(p)) if v < cur]
+        except Exception:
+            lower = []
+        self._stop_process()
+        self.gen += 1
+        self.run_auto = False
+        if not lower:
+            self._log(f"[auto ngl] out of memory at -ngl {cur}, and nothing lower is left. "
+                      f"Lower the context or free RAM, then START again.")
+            self._set_status("Stopped", "#888888")
+            self._set_run_state("stopped")
+            return
+        new = lower[0]
+        saved = self._save_record(p, new, note=f"lowered from {cur} after OOM in real use")
+        self._log(f"[auto ngl] OOM at -ngl {cur} in real use -> saved -ngl {new} ({saved}); restarting")
+        self.choice.set(p["name"])
+        self._update_cmd()
+        self.start()
+
+    def _selected(self):
+        return next(p for p in PRESETS if p["name"] == self.choice.get())
+
+    def _build_cmd(self):
+        p = self._selected()
+        cmd = [p["exe"]] + p["args"]
+        if p["exe"] == "llama-server.exe":
+            cmd += ["--port", self.port.get().strip() or DEFAULT_PORT]
+            cmd += EXTRA_SERVER_ARGS
+            rec = _auto_record(p)               # a saved AUTO NGL value overrides the preset's ngl
+            if rec and "-ngl" in cmd:
+                cmd[cmd.index("-ngl") + 1] = str(rec["ngl"])
+        return cmd
+
+    def _update_cmd(self):
+        text = " ".join(self._build_cmd())
+        p = self._selected()
+        rec = _auto_record(p)
+        if rec:
+            text += f"\n[auto ngl {rec['ngl']} (saved {rec.get('tested_at', '?')}); changes to the model file or ctx re-tune]"
+        elif _auto_applies(p) and _auto_key(p):
+            text += "\n[auto ngl: no saved value yet; START will tune it first]"
+        self.cmd_label.config(text=text)
+        self._refresh_mem()         # Memory tab: loads the file size + GGUF header for the selected model
+
+    def _set_status(self, text, color):
+        self.status.config(text=f" {text} ", bg=color)
+
+    def _set_run_state(self, state):
+        if not hasattr(self, "start_btn"):
+            return
+        if state == "running":
+            self.start_btn.config(text="●  RUNNING", state="disabled")
+        elif state == "starting":
+            self.start_btn.config(text="⏳  LOADING…", state="disabled")
+        elif state == "tuning":
+            self.start_btn.config(text="⚙  Auto-tuning NGL…", state="disabled")
+        else:
+            self.start_btn.config(text="▶  START", state="normal")
+
+    def _log(self, text):
+        self.log.insert("end", text if text.endswith("\n") else text + "\n")
+        if int(self.log.index("end-1c").split(".")[0]) > 3000:
+            self.log.delete("1.0", "500.0")
+        self.log.see("end")
+
+    def start(self):
+        if self.tuning:
+            messagebox.showinfo("Auto-tuning NGL", "Wait for auto-tuning to finish, or press STOP to cancel it.")
+            return
+        p = self._selected()
+        if _auto_applies(p) and _auto_key(p) is not None and _auto_record(p) is None:
+            self._begin_tuning(p)               # first run for this model/ctx/KV: tune, then start
+            return
+        cmd = self._build_cmd()
+        port_value = self.port.get().strip() or DEFAULT_PORT
+        try:
+            port_number = int(port_value)
+            if not 1 <= port_number <= 65535:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Invalid port", "Enter a TCP port number from 1 to 65535.")
+            return
+        exe_path = os.path.join(BASE_DIR, cmd[0])
+        if not os.path.isfile(exe_path):
+            messagebox.showerror("Not found", f"{exe_path} does not exist.\nCheck BASE_DIR in the script.")
+            return
+        # FIX 4: explicit missing-file check at Start, since we no longer hide presets
+        sel = self.choice.get()
+        if sel in MISSING_FILES and MISSING_FILES[sel]:
+            messagebox.showerror("Missing file", f"Preset '{sel}' is missing in {BASE_DIR}:\n{', '.join(MISSING_FILES[sel])}")
+            return
+        model = cmd[cmd.index("-m") + 1]
+        if not os.path.isfile(os.path.join(BASE_DIR, os.path.basename(model))):
+            messagebox.showerror("Model not found", f"{os.path.join(BASE_DIR, model)} does not exist.")
+            return
+        self._stop_process()
+        time.sleep(0.5)
+        self.gen += 1
+        gen = self.gen
+        auto = _auto_applies(p) and _auto_key(p) is not None
+        self.run_auto = auto
+        self.run_preset = p
+        self.run_ngl = int(cmd[cmd.index("-ngl") + 1]) if auto and "-ngl" in cmd else None
+        self.oom_pending = False
+        self._reset_mem()
+        self._log(f"\n=== START: {' '.join(cmd)} ===")
+        try:
+            self.proc = subprocess.Popen(
+                [exe_path] + cmd[1:], cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+        except Exception as e:
+            messagebox.showerror("Failed to start", str(e))
+            self._set_status("Stopped", "#888888")
+            self._set_run_state("stopped")
+            return
+        self._set_status("Starting…", "#d98c00")
+        self._set_run_state("starting")
+        threading.Thread(target=self._reader, args=(self.proc, gen), daemon=True).start()
+
+    def _reader(self, proc, gen):
+        for line in proc.stdout:
+            self.q.put((gen, "line", line))
+        proc.wait()
+        self.q.put((gen, "exit", proc.returncode))
+
+    def _stop_process(self):
+        # FIX 5: only kill OUR process, never any other llama-server.exe on the machine.
+        if self.proc and self.proc.poll() is None:
+            try:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
+                               capture_output=True, creationflags=NO_WINDOW)
+            except Exception:
+                pass
+        self.proc = None
+
+    def stop(self):
+        if self.tuning:
+            self.auto_cancel.set()
+            kill_all_llama()          # the trial server dies; the worker then reports "cancelled"
+            self._log("[auto ngl] stop requested")
+            return
+        self.run_auto = False
+        self.gen += 1
+        self._stop_process()
+        self._set_status("Stopped", "#888888")
+        self._set_run_state("stopped")
+        self._log("=== STOPPED ===")
+        if self.auto_clear.get():
+            self.after(600, self.clear_ram)
+
+    def clear_ram(self):
+        # Only request a standby/file-cache flush here. Other apps' working sets
+        # can be trimmed individually in the Cleaner after explicit selection.
+        before = ram_info()[0]
+        ok, msg = clear_standby_ram()
+        time.sleep(0.3)
+        after = ram_info()[0]
+        self._log(f"[file cache] {msg}  (RAM used {before:.1f} GB -> {after:.1f} GB)")
+
+    def open_cleaner(self):
+        if getattr(self, "cleaner", None) and self.cleaner.winfo_exists():
+            self.cleaner.lift()
+            return
+        w = tk.Toplevel(self)
+        w.title("Memory cleaner")
+        w.geometry("560x580")
+        self.cleaner = w
+        usage = ttk.Label(w, font=("Segoe UI", 10, "bold"))
+        usage.pack(anchor="w", padx=12, pady=(10, 2))
+        bar = ttk.Progressbar(w, maximum=100)
+        bar.pack(fill="x", padx=12)
+        frame = ttk.Frame(w)
+        frame.pack(fill="both", expand=True, padx=12, pady=8)
+        tree = ttk.Treeview(frame, columns=("name", "mem", "n"), show="headings", selectmode="extended")
+        tree.heading("name", text="Application")
+        tree.heading("mem", text="Memory")
+        tree.heading("n", text="Procs")
+        tree.column("name", width=280)
+        tree.column("mem", width=100, anchor="e")
+        tree.column("n", width=60, anchor="e")
+        sb = ttk.Scrollbar(frame, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tree.pack(side="left", fill="both", expand=True)
+        info = ttk.Label(w, text="Ctrl/Shift-click to select several apps.", foreground="#666")
+        info.pack(anchor="w", padx=12)
+        def refresh():
+            used, total, pct = ram_info()
+            usage.config(text=f"Memory usage {pct}%   ({used:.1f} GB / {total:.1f} GB)")
+            bar["value"] = pct
+            tree.delete(*tree.get_children())
+            groups = list_processes()
+            for name, g in sorted(groups.items(), key=lambda kv: kv[1]["ws"], reverse=True):
+                tree.insert("", "end", iid=name, values=(name, f"{g['ws'] / 1024**2:,.0f} MB", len(g["pids"])))
+            self._groups = groups
+        def clean(names):
+            if not names:
+                messagebox.showinfo("Memory cleaner", "Select at least one app.", parent=w)
+                return
+            pids = [pid for n in names for pid in self._groups[n]["pids"]]
+            released, failed = trim_pids(pids)
+            note = f"\n({failed} processes were protected and skipped)" if failed else ""
+            messagebox.showinfo("Memory cleaned", f"Successfully released {released / 1024**2:,.0f} MB of memory.{note}", parent=w)
+            refresh()
+        def clean_selected():
+            names = list(tree.selection())
+            if any(n.lower() in PROCESS_NAMES for n in names) and self.proc and self.proc.poll() is None:
+                if not messagebox.askyesno("Model is running", "Trimming a running llama-server forces its memory to be re-read and slows generation. Continue?", parent=w):
+                    return
+            clean(names)
+        row = ttk.Frame(w)
+        row.pack(fill="x", padx=12, pady=(0, 10))
+        ttk.Button(row, text="Refresh", command=refresh).pack(side="left")
+        ttk.Button(row, text="Select all", command=lambda: tree.selection_set(tree.get_children())).pack(side="left", padx=6)
+        ttk.Button(row, text="Flush Windows cache (admin)", command=lambda: (self._log("[cache] " + clear_standby_ram()[1]), refresh())).pack(side="left")
+        ttk.Button(row, text="CLEAN SELECTED", style="Big.TButton", command=clean_selected).pack(side="right")
+        refresh()
+
+    def _relaunch_admin(self):
+        self._stop_process()
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(__file__)}"', None, 1)
+        self.destroy()
+
+    def _on_close(self):
+        self._stop_process()
+        self.destroy()
+
+    def _drain(self):
+        try:
+            while True:
+                gen, kind, data = self.q.get_nowait()
+                if gen != self.gen:
+                    continue
+                if kind == "line":
+                    self._log(data.rstrip("\n"))
+                    self._parse_mem(data)
+                    if self.run_auto and _is_oom_line(data):
+                        self._schedule_oom(gen)
+                    low = data.lower()
+                    if "listening" in low or "main loop" in low:
+                        self.mem_ready = True
+                        # FIX 6: capture baseline HERE, at Ready, not in the 1s tick.
+                        # If first request already started, baseline is still the current CPU-side RAM.
+                        try:
+                            if (self.proc and self.proc.poll() is None and self.mem_base_cpu is None
+                                    and self.gpu_mem is not None):
+                                pm = process_memory(self.proc.pid)
+                                if pm:
+                                    priv = pm[1] / 1024**2
+                                    gpu = self.gpu_mem
+                                    gsh = gpu[1] if gpu and priv >= gpu[1] else 0.0
+                                    self.mem_base_cpu = max(0.0, priv - gsh)
+                        except Exception:
+                            pass
+                        self._set_status(f"Ready  :{self.port.get()}", "#2e8b57")
+                        self._set_run_state("running")
+                    if "processing task" in low:
+                        self.mem_busy = True
+                elif kind == "exit":
+                    self._log(f"=== process exited (code {data}) ===")
+                    self._set_status("Stopped", "#888888")
+                    self._set_run_state("stopped")
+                    self.proc = None
+        except queue.Empty:
+            pass
+        self.after(100, self._drain)
+
+    def _tick(self):
+        used, total, pct = ram_info()
+        self.ram_label.config(text=f"RAM: {used:.1f} / {total:.1f} GB ({pct}%)",
+                              foreground="#b03030" if pct >= 90 else "#000000")
+        gpu = self.gpu_mem
+        self.vram_label.config(text=f"GPU RAM: {gpu[0] + gpu[1]:,.0f} MiB (from system RAM)" if gpu else "")
+        try:
+            self._refresh_mem()
+        except Exception:
+            pass
+        self.after(1000, self._tick)
+
+if __name__ == "__main__":
+    App().mainloop()

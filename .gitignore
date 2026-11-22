@@ -1,0 +1,7 @@
+﻿*.gguf
+auto_ngl.json
+auto_ngl.json.tmp
+__pycache__/
+*.pyc
+USE_PRISM
+USE_Q2
