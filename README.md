@@ -14,6 +14,14 @@ This launcher starts llama-server.exe on your own laptop. Your prompts stay on y
 [LLM response on localhost chat](screenshot-response.png)
 [Log screen in Launcher](screenshot-log.png)
 
+## Demo Video
+
+Watch the launcher running a model locally on a 16GB laptop:
+
+[[Llama Launcher Demo](https://img.youtube.com/vi/HWK1HUrWzf0/0.jpg)](https://youtu.be/HWK1HUrWzf0)
+
+[Watch on YouTube - Llama Launcher running locally](https://youtu.be/HWK1HUrWzf0)
+
 ## What is inside this repo
 
 - `llama_launcher.pyw` - The launcher. Double click to run.
