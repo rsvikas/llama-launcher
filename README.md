@@ -9,11 +9,17 @@ Repository: https://github.com/rsvikas/llama-launcher-for-16gb-ram
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
+
 [Model loaded in launcher](screenshot-loaded.png)
+
 [Model running log](screenshot-log.png)
+
 [PC memory usage breakdown](screenshot-memory.png)
+
 [Localhost chat screen](screenshot-chat.png)
+
 [LLM response on localhost chat](screenshot-response.png)
+
 [Log screen in Launcher](screenshot-running.png)
 
 ## Demo Video
