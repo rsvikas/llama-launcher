@@ -180,6 +180,24 @@ NEMOTRON_4B_SAMPLING = ["--jinja", "--temp", "1.0", "--top-p", "0.95"]          
 DEEPSEEK_R1_SAMPLING = ["--jinja", "--temp", "0.6", "--top-p", "0.95"]              # DeepSeek-R1 README temp; top-p from distill config
 MINISTRAL_SAMPLING = ["--jinja", "--temp", "0.15", "--top-p", "1.0"]                # Mistral Instruct guidance (0.15 or 0.1)
 
+# --- OLMoE-1B-7B-0924-Instruct (Q6_K) ------------------------------------
+# Config: max_position_embeddings = 4096, hidden_size = 2048, num_hidden_layers = 16,
+#         64 experts, 8 active per token (1.3B active of 6.9B total).
+# AllenAI publishes NO fixed sampling table: generation_config.json leaves the
+# temperature unset and the demo just passes the user's own temperature.
+# So this preset uses the standard chat values, and says so instead of pretending
+# the publisher fixed them.
+OLMOE_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.9", "--top-k", "40",
+                  "--min-p", "0", "--presence-penalty", "0.0", "--repeat-penalty", "1.05"]
+# --- Qwen1.5-MoE-A2.7B-Chat (Q3_K_M) --------------------------------------
+# Config: max_position_embeddings = 32768, 60 experts, 4 active per token
+#         (14.3B total, 2.7B active).
+# Qwen's published generation_config.json for the Qwen1.5-Chat family:
+#   temperature 0.7 | top_p 0.8 | top_k 20 | repetition_penalty 1.05
+# (Qwen's own advice: use these values if you hit code switching or other bad cases.)
+QWEN15MOE_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.8", "--top-k", "20",
+                      "--min-p", "0", "--presence-penalty", "0.0", "--repeat-penalty", "1.05"]
+
 VISION = dict(b=512, ub=512)
 
 # Projector files: try "<name>-mmproj*.gguf" and "mmproj-<name>*.gguf".
@@ -192,155 +210,14 @@ _GEMMA_MM = find_mmproj(["mmproj*gemma*.gguf", "*gemma*mmproj*.gguf"])
 _QWENVL_MM = find_mmproj(["mmproj*Qwen2.5-VL*.gguf", "*Qwen2.5-VL*mmproj*.gguf"])
 _ULTRAVOX_MM = find_mmproj(["mmproj*ultravox*.gguf", "*ultravox*mmproj*.gguf"])
 
-# --- PrismML fork detection: hard gate ---
-def _llama_exe():
-    cand = os.path.join(BASE_DIR, "llama-server.exe")
-    return cand if os.path.exists(cand) else "llama-server.exe"
-
-def _run_capture(args):
-    try:
-        out = subprocess.run(args, capture_output=True, text=True, timeout=5, creationflags=NO_WINDOW)
-        return (out.stdout + out.stderr).lower()
-    except Exception:
-        return ""
-
-def _detect_prism_robust():
-    env = os.environ.get("BONSAI_PRISM", "").strip().lower()
-    if env in ("1", "true", "yes", "prism"):
-        return True, "override BONSAI_PRISM=1"
-    if env in ("0", "false", "no", "stock", "upstream"):
-        return False, "override BONSAI_PRISM=0"
-    if os.path.exists(os.path.join(BASE_DIR, "USE_PRISM")):
-        return True, "marker file USE_PRISM"
-    if os.path.exists(os.path.join(BASE_DIR, "USE_Q2")):
-        return False, "marker file USE_Q2"
-    # A PQ2_0 / PTQ1_0 file in this folder is the strongest signal we have: a stock build cannot load those
-    # files at all. Checking the file is more reliable than --help, which does not list weight types.
-    for label in ("27B", "9B"):
-        for f in BONSAI_PACKS[label]["fork"]:
-            if os.path.exists(os.path.join(BASE_DIR, f)):
-                return True, f"PrismML-only Bonsai file present: {f}"
-    exe = _llama_exe()
-    help_txt = _run_capture([exe, "--help"])
-    # pq2_0 / ptq1_0 are PrismML-only ggml types: an unambiguous signal.
-    if any(term in help_txt for term in ("pq2_0", "ptq1_0")):
-        return True, "help text lists the PrismML types pq2_0/ptq1_0"
-    if any(term in help_txt for term in ("ternary", "prism")):
-        return True, "help text mentions ternary/prism types"
-    ver = _run_capture([exe, "--version"])
-    if re.search(r"prism-b\d{4,}", ver):
-        return True, f"version matches prism-bNNNN pattern: {ver[:80]}"
-    return False, "no ternary/prism capability found in --help or --version"
-
-def _first_existing(candidates):
-    for name in candidates:
-        if os.path.exists(os.path.join(BASE_DIR, name)):
-            return name
-    return None
-
-# PrismML publishes three GGUF packings for Bonsai 2
-# (https://docs.prismml.com/download/formats):
-#   PQ2_0  - publisher default, faster prompt processing -> PrismML binaries only
-#   PTQ1_0 - smallest, faster decode on Ada / L4          -> PrismML binaries only
-#   Q2_0   - upstream llama.cpp b11555+ (also runs on the PrismML binaries)
-# A stock build REFUSES pq2_0 / ptq1_0 ("unknown type"), so the fork decides
-# which packings may be used.
-BONSAI_PACKS = {
-    "27B": {
-        "fork":  ["Ternary-Bonsai-2-27B-PQ2_0.gguf", "Ternary-Bonsai-2-27B-PTQ1_0.gguf"],
-        # The 27B Q2_0 pack is only published in the "-gguf-dev" repo, under the
-        # historical "-prism-fork-required" name (the suffix is historical - the
-        # file does run on upstream llama.cpp b11555+).
-        "stock": ["Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf"],
-        "fork_repo":  "prism-ml/Ternary-Bonsai-2-27B-gguf",
-        "stock_repo": "prism-ml/Ternary-Bonsai-2-27B-gguf-dev",
-    },
-    "9B": {
-        "fork":  ["Ternary-Bonsai-2-9B-PQ2_0.gguf", "Ternary-Bonsai-2-9B-PTQ1_0.gguf"],
-        "stock": ["Ternary-Bonsai-2-9B-Q2_0.gguf"],
-        "fork_repo":  "prism-ml/Ternary-Bonsai-2-9B-gguf",
-        "stock_repo": "prism-ml/Ternary-Bonsai-2-9B-gguf",
-    },
-}
-BONSAI_PACK_SIZES = {
-    "Ternary-Bonsai-2-27B-PQ2_0.gguf": "~7.21 GB",
-    "Ternary-Bonsai-2-27B-PTQ1_0.gguf": "~5.95 GB",
-    "Ternary-Bonsai-2-27B-Q2_0.gguf": "~7.63 GB",
-    "Ternary-Bonsai-2-27B-Q2_0-prism-fork-required.gguf": "~7.63 GB",
-    "Ternary-Bonsai-2-9B-PQ2_0.gguf": "~2.42 GB",
-    "Ternary-Bonsai-2-9B-PTQ1_0.gguf": "~2.00 GB",
-    "Ternary-Bonsai-2-9B-Q2_0.gguf": "~2.56 GB",
-}
-
+# Stock llama.cpp only - only Q2_0 pack runs here, no PrismML fork
+BONSAI_27B_FILE = "Ternary-Bonsai-2-27B-Q2_0.gguf"
+BONSAI_9B_FILE = "Ternary-Bonsai-2-9B-Q2_0.gguf"
 STARTUP_NOTICES = []
-
-def _ensure_bonsai_pack(label, is_prism):
-    """Pick the Bonsai 2 GGUF packing to use and explain what to download.
-
-    Does NOT raise.  Returns the preferred candidate even if missing, so the
-    preset stays visible and start() blocks with the missing-file list.
-    """
-    pack = BONSAI_PACKS[label]
-    # Q2_0 also runs on the PrismML binaries, so it is a valid fallback there.
-    candidates = list(pack["fork"]) + list(pack["stock"]) if is_prism else list(pack["stock"])
-    # Use whatever is really on disk. A PQ2_0 / PTQ1_0 file can only be there because the PrismML binaries are in
-    # use (a stock build cannot even load it), and "--help" does not list weight types, so detection can be wrong.
-    ordered = (list(pack["fork"]) + list(pack["stock"])) if is_prism else (list(pack["stock"]) + list(pack["fork"]))
-    found = _first_existing(ordered)
-    if found:
-        if not is_prism and found in pack["fork"]:
-            STARTUP_NOTICES.append(f"[INFO] Bonsai 2 {label}: using {found}. Stock llama.cpp was assumed, but this "
-                                   f"file needs the PrismML binaries; if the server says 'unknown type', see "
-                                   f"https://docs.prismml.com/download/formats")
-        return found
-
-    msg = [f"[MISSING] Bonsai 2 {label}: no usable GGUF packing found in {BASE_DIR}."]
-    if not is_prism:
-        # The user may own the publisher's pack but be running a stock build.
-        for f in pack["fork"]:
-            if os.path.isfile(os.path.join(BASE_DIR, f)):
-                msg.append(f"  NOTE: {f} IS in {BASE_DIR}, but a stock llama.cpp refuses the "
-                           f"PQ2_0/PTQ1_0 types ('unknown type').")
-                msg.append("        Install the PrismML binaries (https://github.com/PrismML-Eng/llama.cpp) "
-                           "or set BONSAI_PRISM=1 after installing them,")
-                msg.append("        or download the upstream Q2_0 pack listed below instead.")
-                break
-    if is_prism:
-        msg.append("  PrismML fork detected - preferred packs (PQ2_0 = publisher default):")
-        for f in pack["fork"]:
-            msg.append(f"    hf download {pack['fork_repo']} {f} --local-dir .    ({BONSAI_PACK_SIZES.get(f, '')})")
-        msg.append("  Any of these also works on stock llama.cpp b11555+:")
-    else:
-        msg.append("  Stock llama.cpp detected - only the upstream Q2_0 type runs here:")
-    for f in pack["stock"]:
-        repo = pack["stock_repo"]
-        msg.append(f"    hf download {repo} {f} --local-dir .    ({BONSAI_PACK_SIZES.get(f, '')})")
-    msg.append("  (Place the file in " + BASE_DIR + ".)")
-    STARTUP_NOTICES.append("\n".join(msg))
-    print("\n".join(msg))
-    return candidates[0]
-
-_is_prism, _prism_reason = _detect_prism_robust()
-print(f"[INFO] Prism detection: {_is_prism} ({_prism_reason})")
-if not _is_prism:
-    print("=" * 60)
-    print("  STOCK llama.cpp detected - only the upstream Q2_0 packing runs here.")
-    print("  If you installed the PrismML fork and want PQ2_0 / PTQ1_0:")
-    print("    set BONSAI_PRISM=1    (Windows)  or  export BONSAI_PRISM=1")
-    print("  Or create an empty file named USE_PRISM in BASE_DIR.")
-    print("=" * 60)
-else:
-    print("=" * 60)
-    print("  PrismML fork detected - PQ2_0 / PTQ1_0 packings are available.")
-    print("=" * 60)
-
-BONSAI_27B_FILE = _ensure_bonsai_pack("27B", _is_prism)
-BONSAI_9B_FILE = _ensure_bonsai_pack("9B", _is_prism)
 
 # --- Where every preset value above comes from -----------------------------
 # Bonsai 2 27B   https://docs.prismml.com/models/bonsai-2-27b   ("Best practices")
 # Bonsai 2 9B    https://docs.prismml.com/models/bonsai-2-9b    ("Best practices")
-# Bonsai packs   https://docs.prismml.com/download/formats      (PQ2_0 / PTQ1_0 / Q2_0)
 # Gemma 4 E4B    https://ai.google.dev/gemma/docs/core/model_card_4  ("Sampling Parameters")
 # Qwen3-8B       https://huggingface.co/Qwen/Qwen3-8B            ("Best Practices")
 #                https://qwen.readthedocs.io/en/latest/run_locally/llama.cpp.html (llama-cli cmd)
@@ -356,6 +233,8 @@ BONSAI_9B_FILE = _ensure_bonsai_pack("9B", _is_prism)
 # Nemotron 9B v2 https://huggingface.co/nvidia/NVIDIA-Nemotron-Nano-9B-v2 (reasoning on: 0.6/0.95)
 # DeepSeek-R1    https://github.com/deepseek-ai/DeepSeek-R1 (temp 0.5-0.7, recommended 0.6)
 # Ministral 3 8B https://huggingface.co/mistralai/Ministral-3-8B-Instruct-2512 (Instruct: temp 0.15 or 0.1)
+# OLMoE 1B-7B   https://huggingface.co/allenai/OLMoE-1B-7B-0924-Instruct  (ctx 4096; no fixed sampling table)
+# Qwen1.5-MoE  https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat        (generation_config.json: 0.7/0.8/20/1.05)
 # llama.cpp CLI  https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
 PRESETS = [
     preset("1. Bonsai 2 27B  |  THINKING (publisher sampler)", BONSAI_27B_FILE, ctx(8192) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
@@ -387,6 +266,12 @@ PRESETS = [
     preset("18. DeepSeek-R1-Distill-Qwen-7B Q4_K_M  |  REASONING (DeepSeek sampler)", "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + DEEPSEEK_R1_SAMPLING + REASONING_ON),
     preset("19. Ministral 3 8B Instruct 2512 Q4_K_M  |  DENSE, Mistral Instruct guidance", "Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MINISTRAL_SAMPLING),
     preset("20. Nemotron-Nano-9B-v2 Q4_K_M OFFICIAL", "Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf", ctx(4096, b=128, ub=32, ngl=16) + KV + ["--jinja", "--temp", "0.6", "--top-p", "0.95"]),
+    # OLMoE: the official max context is 4096, so this preset uses exactly that (nothing to cut).
+    preset("21. OLMoE 1B-7B Q6_K  |  MoE (64 experts, 8 active), chat sampler", "OLMoE-Q6_K.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + OLMOE_SAMPLING),
+    # Qwen1.5-MoE: official max is 32768, but that OOMs at this file size on a 7-9 GB laptop.
+    # 2048 is the context that actually runs; 4096 is kept as an "if you have the RAM" variant.
+    preset("22. Qwen1.5-MoE-A2.7B-Chat Q3_K_M  |  MoE (60 experts, 4 active), Qwen sampler", "Qwen-MoE-Q3_K_M.gguf", ctx(2048, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
+    preset("22b. Qwen1.5-MoE-A2.7B-Chat Q3_K_M  |  ctx 4096 (needs ~9 GB free)", "Qwen-MoE-Q3_K_M.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
 ]
 def _preset_files(p):
     names = [p["exe"]]
@@ -687,6 +572,7 @@ AUTO_CANDIDATES = [32, 16, 8, 4, 0]     # descending; only values <= the real la
 AUTO_OOM_WORDS = ("outofdevicememory", "outofhostmemory", "decode() failed", "failed to allocate", "ggml_assert")
 AUTO_LOAD_TIMEOUT = 240                 # seconds for /health to answer
 AUTO_TEST_TIMEOUT = 600                 # seconds for the generation test (slow at low ngl)
+AUTO_FREE_RESERVE_MIB = 1024            # RAM kept free for the OS while the server loads
 
 
 def _base(path):
@@ -718,15 +604,61 @@ def _first_oom(lines):
 
 
 def _auto_applies(p):
-    """Only stock-compatible llama-server presets with -ngl. Bonsai needs PrismML, so it is excluded."""
-    if p["exe"] != "llama-server.exe" or "-ngl" not in p["args"] or "-m" not in p["args"]:
-        return False
-    model = _base(p["args"][p["args"].index("-m") + 1])
-    return not model.lower().startswith("ternary-bonsai")
+    """All llama-server presets with -ngl. No model is excluded."""
+    return p["exe"] == "llama-server.exe" and "-ngl" in p["args"] and "-m" in p["args"]
 
+
+def _free_ram_mib():
+    try:
+        used, total, _ = ram_info()
+        return int((total - used) * 1024)
+    except Exception:
+        return None
+
+def _wait_for_ram_settle(seconds=20.0, poll=0.5, delta=32):
+    """Block until free RAM stops moving.
+
+    A killed llama-server gives its Vulkan shared memory back slowly. Starting the
+    next server straight away puts it into a half-drained pool, and it then fails on
+    allocations of a few KB even though it loaded fine a moment ago. Wait until the
+    pool has stopped shrinking before starting the next one.
+    """
+    try:
+        prev = _free_ram_mib()
+        if prev is None:
+            return
+        deadline = time.time() + seconds
+        stable = 0
+        while time.time() < deadline:
+            time.sleep(poll)
+            cur = _free_ram_mib()
+            if cur is None:
+                return
+            if abs(cur - prev) < delta:       # the pool stopped moving
+                stable += 1
+                if stable >= 3:
+                    return
+            else:
+                stable = 0
+            prev = cur
+    except Exception:
+        return
+
+def _auto_is_stale(p, rec):
+    """True if free RAM dropped a lot since tuning. Saved value was tuned with more RAM free."""
+    if not rec or "free_ram_mib_at_tune" not in rec:
+        return False
+    tuned = rec.get("free_ram_mib_at_tune")
+    if not isinstance(tuned, (int, float)):   # tuning ran without a RAM reading: cannot judge
+        return False
+    cur = _free_ram_mib()
+    if cur is None:
+        return False
+    return cur < tuned - 1536
 
 def _auto_key(p):
-    """Model file + size + mtime + ctx + KV type + batch sizes + mmproj. A reconverted file gets a new key.
+    """Model file + size + mtime + ctx + KV type + batch sizes + cache-ram + mmproj.
+    A reconverted file gets a new key. A changed --cache-ram also gets a new key.
     -ngl is not part of the key: it is the value being tuned."""
     if not _auto_applies(p):
         return None
@@ -749,7 +681,8 @@ def _auto_key(p):
             mm = ["missing"]
     blob = json.dumps({"model": _base(rel), "size": st.st_size, "mtime": int(st.st_mtime),
                        "mmproj": mm, "ctx": val("-c"), "ctk": val("-ctk"), "ctv": val("-ctv"),
-                       "fa": val("-fa"), "b": val("-b"), "ub": val("-ub")}, sort_keys=True)
+                       "fa": val("-fa"), "b": val("-b"), "ub": val("-ub"),
+                       "cache_ram": val("--cache-ram")}, sort_keys=True)
     return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
 
 
@@ -757,7 +690,15 @@ def load_auto_ngl():
     try:
         with open(AUTO_NGL_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        cleaned = {k: v for k, v in data.items() if isinstance(v, dict) and "cache_ram" in v and "ngl" in v and "ctx" in v and "mmproj" in v}
+        if len(cleaned) != len(data):
+            try:
+                save_auto_ngl(cleaned)
+            except Exception:
+                pass
+        return cleaned
     except Exception:
         return {}
 
@@ -779,19 +720,32 @@ def _auto_record(p):
 
 def _auto_layers(p):
     path = os.path.join(BASE_DIR, p["args"][p["args"].index("-m") + 1])
-    info = read_gguf_info(path)
+    try:
+        info = read_gguf_info(path)
+    except Exception:
+        return None
     arch = info.get("arch")
     n = info.get(f"{arch}.block_count") if arch else None
-    return int(n) if isinstance(n, int) else None
+    if isinstance(n, int) and n > 0:
+        return n
+    for k, v in info.items():
+        if k.endswith(".block_count") and isinstance(v, int) and v > 0:
+            return v
+    v = info.get("general.block_count")
+    if isinstance(v, int) and v > 0:
+        return v
+    return None
 
 
 def _auto_trials(layers):
-    """99 = all layers (output layer included), then descending unique values <= the real layer count.
-    36 layers -> 99, 36, 32, 16, 8, 4, 0.   28 layers -> 99, 28, 16, 8, 4, 0.   unknown -> 99, 32, 16, 8, 4, 0."""
-    vals = {v for v in AUTO_CANDIDATES if layers is None or v <= layers}
-    if layers:
-        vals.add(layers)
-    return [99] + sorted(vals, reverse=True)
+    """Coarse list only, no duplicate 99 trial. Top is layers + 1 for full offload.
+    36 layers -> [37, 36, 32, 16, 8, 4, 0]. 16 layers -> [17, 16, 8, 4, 0]. Unknown -> [99, 32, 16, 8, 4, 0].
+    Fine values like 24, 20, 12 are found later by the climb, not by trying every value."""
+    if layers is None:
+        return [99] + AUTO_CANDIDATES
+    top = layers + 1
+    vals = sorted({v for v in AUTO_CANDIDATES if v <= layers} | {layers, top}, reverse=True)
+    return vals
 
 
 def _http_json(url, body=None, timeout=5):
@@ -828,6 +782,11 @@ def _auto_try(p, port, ngl, cancel):
         if cancel.is_set():
             return "cancelled", "", {}
         time.sleep(0.5)
+    # The port is free, but the previous trial's Vulkan memory may still be draining.
+    # Starting this trial into a half-drained pool makes it fail below the real limit,
+    # so the tuner would record a value that is too low.
+    if not cancel.is_set():
+        _wait_for_ram_settle()
     proc = subprocess.Popen(cmd, cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     threading.Thread(target=reader, args=(proc,), daemon=True).start()
@@ -892,17 +851,64 @@ def _auto_try(p, port, ngl, cancel):
             pass
 
 
+def _auto_safe_start(p, layers, free_mib):
+    """If file + KV + cache-ram + 1 GB reserve is bigger than free RAM, full offload will almost surely OOM.
+    Return the highest coarse value to START from. Climb will still try higher if it actually works."""
+    if layers is None or free_mib is None:
+        return None
+    try:
+        rel = p["args"][p["args"].index("-m") + 1]
+        fpath = os.path.join(BASE_DIR, rel)
+        fsize = os.path.getsize(fpath) / 1024 ** 2
+        a = p["args"]
+
+        def val(flag, default=None):
+            return a[a.index(flag) + 1] if flag in a else default
+
+        ctx_tokens = int(val("-c", 4096))
+        try:
+            info = read_gguf_info(fpath)
+            kv = estimate_kv_mib(info, ctx_tokens, val("-ctk", "f16"), val("-ctv", "f16")) or 0
+        except Exception:
+            kv = 0
+        cache_ram = int(val("--cache-ram", 2048))
+        need = fsize + kv + cache_ram + AUTO_FREE_RESERVE_MIB
+        if need <= free_mib:
+            return None
+        half = layers // 2
+        cands = [v for v in _auto_trials(layers) if v <= half]
+        return cands[0] if cands else 0
+    except Exception:
+        return None
+
+
 def auto_tune_ngl(p, port, out, cancel):
     """Worker thread (no Tk calls). Puts ('log', text), then exactly one of
-    ('done', ngl, meta), ('failed', reason) or ('cancelled', None)."""
+    ('done', ngl, meta), ('failed', reason) or ('cancelled', None).
+    Phase 1: coarse trials, full prompt. Phase 2: binary-search climb to the highest working value."""
     try:
         try:
             layers = _auto_layers(p)
             note = ""
-        except Exception as e:                  # unreadable header: still tune, with the unknown-layer list
+        except Exception as e:
             layers, note = None, f" (could not read the layer count: {e})"
         trials = _auto_trials(layers)
-        out.put(("log", f"[auto ngl] {p['name']}: layers={layers}{note}, trying -ngl {trials}"))
+        free = _free_ram_mib()
+        cache_ram = None
+        a = p["args"]
+        if "--cache-ram" in a:
+            cache_ram = a[a.index("--cache-ram") + 1]
+        safe = _auto_safe_start(p, layers, free)
+        skipped_top = None
+        if safe is not None and trials and safe < trials[0]:
+            skipped_top = trials[0]
+            trials = [v for v in trials if v <= safe]
+            out.put(("log", f"[auto ngl] file + KV + cache-ram is bigger than free RAM, skipping top trial {skipped_top}, starting from {trials[0]}. Climb will still try higher if it works."))
+        out.put(("log", f"[auto ngl] {p['name']}: layers={layers}{note}, free RAM={free} MiB, cache-ram={cache_ram}, trying -ngl {trials}"))
+        low_ok = None
+        high_fail = skipped_top
+        last_meta = None
+        last_error = None
         for ngl in trials:
             if cancel.is_set():
                 out.put(("cancelled", None))
@@ -913,14 +919,60 @@ def auto_tune_ngl(p, port, out, cancel):
                 out.put(("cancelled", None))
                 return
             if status == "ok":
-                meta["layers"] = layers
-                out.put(("done", ngl, meta))
-                return
+                low_ok = ngl
+                last_meta = meta
+                break
             if status == "other":
-                out.put(("failed", f"not an out-of-memory error, so a lower -ngl will not help: {detail}"))
-                return
+                if "already in use" in detail:
+                    out.put(("failed", f"not an out-of-memory error, so a lower -ngl will not help: {detail}"))
+                    return
+                # The server died without printing an OOM line. A Vulkan allocation kill looks exactly
+                # like this: the process is gone, so the client only sees the connection drop.
+                # Treat it as too high and keep looking lower for a value that actually works.
+                high_fail = ngl
+                last_error = detail
+                out.put(("log", f"[auto ngl]   -ngl {ngl}: failed with non-OOM error, treating as too high: {detail[:200]}"))
+                continue
+            high_fail = ngl
             out.put(("log", f"[auto ngl]   -ngl {ngl}: out of memory: {detail[:200]}"))
-        out.put(("failed", f"out of memory at every -ngl in {trials}: free RAM is too low for this model at this context"))
+        if low_ok is None:
+            if last_error:
+                out.put(("failed", f"no working -ngl in {trials}: the server failed with a non-OOM error: {last_error}"))
+            else:
+                out.put(("failed", f"out of memory at every -ngl in {trials}: free RAM is too low for this model at this context"))
+            return
+        if high_fail is not None and high_fail - low_ok > 1:
+            lo, hi = low_ok, high_fail
+            best = low_ok
+            best_meta = last_meta
+            out.put(("log", f"[auto ngl] climb: searching between working {lo} and OOM {hi} for the highest working value"))
+            while hi - lo > 1:
+                if cancel.is_set():
+                    out.put(("cancelled", None))
+                    return
+                mid = (lo + hi) // 2
+                out.put(("log", f"[auto ngl] climb: trying -ngl {mid} ..."))
+                status, detail, meta = _auto_try(p, port, mid, cancel)
+                if status == "cancelled":
+                    out.put(("cancelled", None))
+                    return
+                if status == "ok":
+                    best = mid
+                    lo = mid
+                    best_meta = meta
+                elif status == "oom":
+                    hi = mid
+                    out.put(("log", f"[auto ngl]   -ngl {mid}: out of memory"))
+                else:
+                    hi = mid
+                    out.put(("log", f"[auto ngl]   -ngl {mid}: failed with non-OOM error, treating as too high, keeping best {best}: {detail[:200]}"))
+            low_ok = best
+            last_meta = best_meta
+        last_meta["layers"] = layers
+        last_meta["free_ram_mib_at_tune"] = free
+        last_meta["cache_ram"] = cache_ram
+        out.put(("done", low_ok, last_meta))
+        return
     except Exception as e:
         out.put(("failed", f"internal error: {e}"))
 
@@ -981,6 +1033,7 @@ class App(tk.Tk):
         port.bind("<KeyRelease>", lambda e: self._update_cmd())
         self.cmd_label = ttk.Label(self, text="", foreground="#666", wraplength=860, justify="left")
         self.cmd_label.pack(fill="x", padx=10)
+        self.cmd_label.bind("<Configure>", self._fit_cmd_wrap)
         btns = ttk.Frame(self)
         btns.pack(fill="x", **pad)
         style = ttk.Style()
@@ -1017,7 +1070,7 @@ class App(tk.Tk):
         self.nb.add(logf, text="  Log  ")
         self.nb.add(memf, text="  Memory breakdown  ")
         self._build_mem_tab(memf)
-        self.log = tk.Text(logf, bg="#111", fg="#ddd", font=("Consolas", 9), wrap="none", insertbackground="white")
+        self.log = tk.Text(logf, bg="#111", fg="#ddd", font=("Consolas", 9), wrap="word", insertbackground="white")
         sb = ttk.Scrollbar(logf, command=self.log.yview)
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
@@ -1038,10 +1091,12 @@ class App(tk.Tk):
         self.mem_ready = False
         self.mem_busy = False
         self.mem_base_cpu = None
+        self.mem_printed_buffers = False   # does this llama.cpp build print buffer sizes at all?
 
     def _parse_mem(self, line):
         m = MEM_RE.search(line)
         if m:
+            self.mem_printed_buffers = True
             dev, key, mib = m.group(1), m.group(2).lower(), float(m.group(3))
             d = self.mem[key]
             if key in ("model", "kv", "rs"):
@@ -1126,6 +1181,35 @@ class App(tk.Tk):
         self.mem_hint = ttk.Label(inner, text="", foreground="#555", wraplength=820, justify="left")
         self.mem_hint.pack(fill="x", padx=8, pady=(6, 12))
         self._refresh_mem()
+        inner.bind("<Configure>", self._fit_mem_wrap)
+
+    def _fit_cmd_wrap(self, event):
+        """Wrap the command line to the window width instead of a fixed number."""
+        try:
+            w = max(200, event.width - 12)
+            if w != getattr(self, "_cmd_wrap_w", None):
+                self._cmd_wrap_w = w
+                self.cmd_label.configure(wraplength=w)
+        except Exception:
+            pass
+
+    def _fit_mem_wrap(self, event):
+        """Re-flow every wrapped text in the memory tab when the window is resized."""
+        try:
+            w = event.width
+            if w == getattr(self, "_mem_wrap_w", None):
+                return
+            self._mem_wrap_w = w
+            full = max(240, w - 20)      # labels that span the whole tab
+            desc = max(240, w - 400)     # description column: tab minus the fixed columns
+            for lbl in getattr(self, "mem_desc", {}).values():
+                lbl.configure(wraplength=desc)
+            self.mem_info.configure(wraplength=full)
+            self.mem_note.configure(wraplength=full)
+            self.mem_hint.configure(wraplength=full)
+            self.mem_totals.configure(wraplength=full)
+        except Exception:
+            pass
 
     def _load_model_info(self):
         """Weights = file size (read first). KV and layer info = GGUF header (may fail on its own)."""
@@ -1430,6 +1514,10 @@ class App(tk.Tk):
         dflt = "Not measured yet" if running else "Shows when the server is running"
         text.setdefault("rs", ("Included in GPU total" if hybrid else "Not used"))
         text.setdefault("output", "< 1 MiB, negligible")
+        if running and not getattr(self, "mem_printed_buffers", False):
+            # No buffer-size line at all: this build does not print them, so waiting
+            # for them is pointless.  Say that instead of "not measured yet".
+            text.setdefault("compute", "Not reported\n(by this build)")
         for k in ("compute", "cache", "other"):
             text.setdefault(k, dflt)
         for key, _, _, _ in COMPONENTS:
@@ -1483,7 +1571,7 @@ class App(tk.Tk):
             x += seg
 
     # ---------------- AUTO NGL (driven by START) ----------------
-    def _begin_tuning(self, p):
+    def _begin_tuning(self, p, reason="no saved value yet"):
         try:
             port = int(self.port.get().strip() or DEFAULT_PORT)
             if not 1 <= port <= 65535:
@@ -1497,7 +1585,7 @@ class App(tk.Tk):
         self.auto_q = queue.Queue()
         self._set_run_state("tuning")
         self._set_status("Auto-tuning NGL…", "#d98c00")
-        self._log(f"\n=== Auto-tuning NGL for {p['name']} (port {port}): no saved value yet ===")
+        self._log(f"\n=== Auto-tuning NGL for {p['name']} (port {port}): {reason} ===")
         self._log("[auto ngl] each trial loads the model; big models take several minutes")
         threading.Thread(target=auto_tune_ngl, args=(p, port, self.auto_q, self.auto_cancel), daemon=True).start()
         self.after(200, self._poll_auto)
@@ -1543,8 +1631,24 @@ class App(tk.Tk):
 
     def _save_record(self, p, ngl, meta=None, note=None):
         key = _auto_key(p)
-        rec = {"model": _base(p["args"][p["args"].index("-m") + 1]), "ngl": ngl,
+        model_name = _base(p["args"][p["args"].index("-m") + 1])
+        a = p["args"]
+        ctx_value = a[a.index("-c") + 1] if "-c" in a else None
+        mm_value = _base(a[a.index("--mmproj") + 1]) if "--mmproj" in a else None
+        cache_value = a[a.index("--cache-ram") + 1] if "--cache-ram" in a else None
+        live_keys = set()
+        for q in PRESETS:
+            qk = _auto_key(q)
+            if qk:
+                live_keys.add(qk)
+        for k in list(AUTO_CACHE.keys()):
+            if AUTO_CACHE[k].get("model") == model_name and AUTO_CACHE[k].get("ctx") == ctx_value \
+                    and AUTO_CACHE[k].get("mmproj") == mm_value and k != key and k not in live_keys:
+                del AUTO_CACHE[k]
+        rec = {"model": model_name, "ngl": ngl, "ctx": ctx_value, "mmproj": mm_value,
                "tested_at": time.strftime("%Y-%m-%d %H:%M"), **(meta or {})}
+        if "cache_ram" not in rec:
+            rec["cache_ram"] = cache_value
         if note:
             rec["note"] = note
         AUTO_CACHE[key] = rec
@@ -1566,10 +1670,10 @@ class App(tk.Tk):
         if gen != self.gen or not self.run_auto or self.tuning:
             return
         p, cur = self.run_preset, self.run_ngl
-        try:
-            lower = [v for v in _auto_trials(_auto_layers(p)) if v < cur]
-        except Exception:
+        if cur is None or cur <= 0:
             lower = []
+        else:
+            lower = [cur - 1]
         self._stop_process()
         self.gen += 1
         self.run_auto = False
@@ -1606,6 +1710,8 @@ class App(tk.Tk):
         rec = _auto_record(p)
         if rec:
             text += f"\n[auto ngl {rec['ngl']} (saved {rec.get('tested_at', '?')}); changes to the model file or ctx re-tune]"
+            if rec.get("note"):
+                text += f"\n[{rec['note']}]"
         elif _auto_applies(p) and _auto_key(p):
             text += "\n[auto ngl: no saved value yet; START will tune it first]"
         self.cmd_label.config(text=text)
@@ -1637,8 +1743,13 @@ class App(tk.Tk):
             messagebox.showinfo("Auto-tuning NGL", "Wait for auto-tuning to finish, or press STOP to cancel it.")
             return
         p = self._selected()
-        if _auto_applies(p) and _auto_key(p) is not None and _auto_record(p) is None:
-            self._begin_tuning(p)               # first run for this model/ctx/KV: tune, then start
+        rec = _auto_record(p)
+        if _auto_applies(p) and _auto_key(p) is not None and (rec is None or _auto_is_stale(p, rec)):
+            if rec is not None:
+                self._log(f"[auto ngl] saved -ngl {rec['ngl']} is stale: free RAM dropped since tuning, retuning")
+                self._begin_tuning(p, reason=f"saved -ngl {rec['ngl']} is stale, retuning")
+            else:
+                self._begin_tuning(p)               # first run for this model/ctx/KV: tune, then start
             return
         cmd = self._build_cmd()
         port_value = self.port.get().strip() or DEFAULT_PORT
@@ -1663,7 +1774,7 @@ class App(tk.Tk):
             messagebox.showerror("Model not found", f"{os.path.join(BASE_DIR, model)} does not exist.")
             return
         self._stop_process()
-        time.sleep(0.5)
+        self._wait_ram()
         self.gen += 1
         gen = self.gen
         auto = _auto_applies(p) and _auto_key(p) is not None
@@ -1691,6 +1802,20 @@ class App(tk.Tk):
             self.q.put((gen, "line", line))
         proc.wait()
         self.q.put((gen, "exit", proc.returncode))
+
+    def _wait_ram(self):
+        """Wait until the freed memory of the previous server is really back.
+
+        The Vulkan shared-memory pool of a killed llama-server is released slowly.
+        Starting the next one too early makes it fail on allocations of a few KB,
+        which looks like a much lower limit than it really is.
+        """
+        try:
+            self._set_status("Waiting for RAM…", "#d98c00")
+            self.update_idletasks()
+        except Exception:
+            pass
+        _wait_for_ram_settle()
 
     def _stop_process(self):
         # FIX 5: only kill OUR process, never any other llama-server.exe on the machine.
