@@ -31,7 +31,7 @@ DEFAULT_PORT = "8080"
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-24.14"
+APP_VERSION = "2026-11-24.18"
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -657,6 +657,10 @@ AUTO_OOM_WORDS = ("outofdevicememory", "outofhostmemory", "decode() failed", "fa
 AUTO_LOAD_TIMEOUT = 240                 # seconds for /health to answer
 AUTO_TEST_TIMEOUT = 600                 # seconds for the generation test (slow at low ngl)
 AUTO_FREE_RESERVE_MIB = 1024            # RAM kept free for the OS while the server loads
+AUTO_FREE_RAM_RISE_MIB = 4096           # more free RAM than this since tuning = the saved value is probably too low
+AUTO_RETUNE_COOLDOWN_S = 3600           # at most one automatic re-tune per hour, per preset
+AUTO_STEPDOWN_COOLDOWN_S = 600          # after an out-of-memory step-down, no re-tune for 10 minutes
+AUTO_RAM_SAMPLES = 3                    # free RAM is read this many times
 
 
 def _base(path):
@@ -765,7 +769,7 @@ def _free_ram_mib():
     except Exception:
         return None
 
-def _wait_for_ram_settle(seconds=20.0, poll=0.5, delta=32):
+def _wait_for_ram_settle(seconds=25.0, poll=0.5, delta=48):
     """Block until free RAM stops moving.
 
     A killed llama-server gives its Vulkan shared memory back slowly. Starting the
@@ -786,13 +790,43 @@ def _wait_for_ram_settle(seconds=20.0, poll=0.5, delta=32):
                 return
             if abs(cur - prev) < delta:       # the pool stopped moving
                 stable += 1
-                if stable >= 3:
+                if stable >= 5:               # 2.5 s of quiet, not 1.5 s
                     return
             else:
                 stable = 0
             prev = cur
     except Exception:
         return
+
+def _free_ram_reading(samples=AUTO_RAM_SAMPLES, gap=1.0, mode="min"):
+    """Free RAM, read a few times.
+
+    mode="min" gives the lowest reading.  That is the one to use when asking "how much
+    RAM is free now?": the lowest reading is the one that is still true in the worst
+    moment, and the Windows file cache alone moves this number by more than a gigabyte
+    when a 7 GB model file is read or trimmed.
+
+    mode="max" gives the highest reading.  That is the one to use for the baseline a
+    saved value is compared against.  Right after a server was killed its memory is
+    still coming back, so a reading taken then is far too low; a baseline that is too
+    low makes the launcher think the machine got faster, and it starts a re-tune that
+    was not needed.
+    """
+    try:
+        n = max(1, int(samples))
+    except Exception:
+        n = 1
+    readings = []
+    for i in range(n):
+        r = _free_ram_mib()
+        if r is not None:
+            readings.append(r)
+        if i + 1 < n:
+            time.sleep(gap)
+    if not readings:
+        return None
+    return max(readings) if mode == "max" else min(readings)
+
 
 def _auto_is_stale(p, rec):
     """True if free RAM dropped a lot since tuning. Saved value was tuned with more RAM free."""
@@ -801,10 +835,41 @@ def _auto_is_stale(p, rec):
     tuned = rec.get("free_ram_mib_at_tune")
     if not isinstance(tuned, (int, float)):   # tuning ran without a RAM reading: cannot judge
         return False
-    cur = _free_ram_mib()
+    cur = _free_ram_reading(mode="min")
     if cur is None:
         return False
     return cur < tuned - 1536
+
+
+def _auto_is_pessimistic(p, rec):
+    """True if a lot more RAM is free now than when the value was tuned.
+
+    The saved number of GPU layers was measured with less RAM free, so it is probably
+    too low.  Without this rule a record written by the out-of-memory step-down stays
+    at its lowered value for ever: nothing ever raises it again, even after the user
+    closes the apps that caused the out-of-memory in the first place.
+
+    Three things keep this rule from running wild:
+      * the margin is large, because the file cache alone moves the reading by gigabytes
+      * the reading is the lowest of a few samples, not a single number
+      * a value that was just tuned is locked for an hour, so a re-tune cannot
+        immediately claim that there is even more RAM free and start another one
+    """
+    if not rec or "free_ram_mib_at_tune" not in rec:
+        return False
+    tuned = rec.get("free_ram_mib_at_tune")
+    if not isinstance(tuned, (int, float)):
+        return False
+    lock = rec.get("retune_lock_until")
+    if isinstance(lock, (int, float)) and time.time() < lock:
+        return False               # tuned recently: leave it alone for now
+    cur = _free_ram_reading(mode="min")
+    if cur is None:
+        return False
+    layers = _auto_layers(p)
+    if isinstance(layers, int) and rec.get("ngl", 0) >= layers:
+        return False            # already fully offloaded: a re-tune cannot give more
+    return cur > tuned + AUTO_FREE_RAM_RISE_MIB
 
 def _auto_key(p):
     """Model file + size + mtime + ctx + KV type + batch sizes + cache-ram + mmproj.
@@ -965,7 +1030,7 @@ def _auto_try(p, port, ngl, cancel, args=None):
         # 2) generation with a long prompt: this is where the decode OOM showed up
         mark = len(lines)
         body = {"messages": [{"role": "user", "content": _test_prompt(ctx_tokens)}],
-                "max_tokens": 32, "temperature": 0, "stream": False}
+                "max_tokens": 64, "temperature": 0, "stream": False}
         try:
             _, res = _http_json(f"http://127.0.0.1:{port}/v1/chat/completions", body, timeout=AUTO_TEST_TIMEOUT)
         except urllib.error.HTTPError as e:
@@ -1095,29 +1160,66 @@ def auto_tune_ngl(p, port, out, cancel, args=None):
             lo, hi = low_ok, high_fail
             best = low_ok
             best_meta = last_meta
+            floor = low_ok
             out.put(("log", f"[auto ngl] climb: searching between working {lo} and OOM {hi} for the highest working value"))
-            while hi - lo > 1:
-                if cancel.is_set():
-                    out.put(("cancelled", None))
-                    return
-                mid = (lo + hi) // 2
-                out.put(("log", f"[auto ngl] climb: trying -ngl {mid} ..."))
-                status, detail, meta = _auto_try(p, port, mid, cancel, args)
+            while True:
+                while hi - lo > 1:
+                    if cancel.is_set():
+                        out.put(("cancelled", None))
+                        return
+                    mid = (lo + hi) // 2
+                    out.put(("log", f"[auto ngl] climb: trying -ngl {mid} ..."))
+                    status, detail, meta = _auto_try(p, port, mid, cancel, args)
+                    if status == "cancelled":
+                        out.put(("cancelled", None))
+                        return
+                    if status == "ok":
+                        best = mid
+                        lo = mid
+                        best_meta = meta
+                    elif status == "oom":
+                        hi = mid
+                        out.put(("log", f"[auto ngl]   -ngl {mid}: out of memory"))
+                    else:
+                        hi = mid
+                        out.put(("log", f"[auto ngl]   -ngl {mid}: failed with non-OOM error, treating as too high, keeping best {best}: {detail[:200]}"))
+                # The winner is tried once more.  A trial can pass in a lucky moment -
+                # the file cache is in a different state, the machine is a little
+                # quieter - and then the very same value fails in real use.  One extra
+                # trial costs one model load and catches that before the user does.
+                out.put(("log", f"[auto ngl] re-checking -ngl {best} ..."))
+                status, detail, meta = _auto_try(p, port, best, cancel, args)
                 if status == "cancelled":
                     out.put(("cancelled", None))
                     return
                 if status == "ok":
-                    best = mid
-                    lo = mid
                     best_meta = meta
-                elif status == "oom":
-                    hi = mid
-                    out.put(("log", f"[auto ngl]   -ngl {mid}: out of memory"))
-                else:
-                    hi = mid
-                    out.put(("log", f"[auto ngl]   -ngl {mid}: failed with non-OOM error, treating as too high, keeping best {best}: {detail[:200]}"))
+                    break
+                if best <= floor:
+                    out.put(("log", f"[auto ngl]   -ngl {best} failed the re-check too ({detail[:160]}). "
+                                    f"Keeping it: it worked once, and everything lower is slower."))
+                    break
+                out.put(("log", f"[auto ngl]   -ngl {best} failed the re-check ({detail[:160]}), looking lower"))
+                hi = best
+                lo = floor
+                best = floor
+                best_meta = last_meta
+            # The climb's winner always sits directly under a value that failed, so by
+            # definition it is at the edge of what the machine can hold.  A trial can
+            # pass in a better moment than a real request finds (the file cache is in
+            # another state, the machine is a little quieter), and the price of being
+            # one layer too high is an out-of-memory error in the middle of an answer.
+            # One layer of headroom is kept: the value below the winner is strictly
+            # safer than the winner itself, and it never goes below the coarse floor.
+            ceiling = best
+            if best > floor:
+                best = best - 1
+                out.put(("log", f"[auto ngl] -ngl {ceiling} is the edge of what this machine holds "
+                                f"(the value above it failed). Using -ngl {best} instead, so a real "
+                                f"request does not run out of memory."))
             low_ok = best
             last_meta = best_meta
+            last_meta["ceiling_ngl"] = ceiling
         last_meta["layers"] = layers
         last_meta["free_ram_mib_at_tune"] = free
         last_meta["cache_ram"] = cache_ram
@@ -1125,6 +1227,36 @@ def auto_tune_ngl(p, port, out, cancel, args=None):
         return
     except Exception as e:
         out.put(("failed", f"internal error: {e}"))
+
+
+def _lighter_preset_for(p):
+    """A preset that runs the same model file with a smaller context, if there is one.
+
+    Used by the "not enough RAM" warning: naming the lighter cut of the same model is
+    more useful than only saying "close some apps".
+    """
+    a = p["args"]
+    if "-m" not in a:
+        return None
+    model = _base(a[a.index("-m") + 1]).lower()
+    try:
+        my_ctx = int(a[a.index("-c") + 1]) if "-c" in a else 0
+    except ValueError:
+        my_ctx = 0
+    best = None
+    for q in PRESETS:
+        b = q["args"]
+        if "-m" not in b or q["name"] == p["name"]:
+            continue
+        if _base(b[b.index("-m") + 1]).lower() != model:
+            continue
+        try:
+            q_ctx = int(b[b.index("-c") + 1]) if "-c" in b else 0
+        except ValueError:
+            q_ctx = 0
+        if q_ctx and my_ctx and q_ctx < my_ctx and (best is None or q_ctx < best[1]):
+            best = (q["name"], q_ctx)
+    return best
 
 
 class App(tk.Tk):
@@ -1803,7 +1935,10 @@ class App(tk.Tk):
         if kind == "done":
             ngl, meta = item[1], item[2]
             saved = self._save_record(p, ngl, meta=meta)
-            self._log(f"[auto ngl] RESULT: -ngl {ngl} loads and answers a long prompt ({saved}). Starting…")
+            ceiling = (meta or {}).get("ceiling_ngl")
+            spare = (f" (the machine could hold -ngl {ceiling}, one layer is kept in reserve)"
+                     if isinstance(ceiling, int) and ceiling > ngl else "")
+            self._log(f"[auto ngl] RESULT: -ngl {ngl} loads and answers a long prompt{spare} ({saved}). Starting…")
             self.choice.set(p["name"])          # START must use the preset that was tuned
             self._update_cmd()
             self._set_status("Stopped", "#888888")
@@ -1840,6 +1975,25 @@ class App(tk.Tk):
                "tested_at": time.strftime("%Y-%m-%d %H:%M"), **(meta or {})}
         if "cache_ram" not in rec:
             rec["cache_ram"] = cache_value
+        # The baseline is the free RAM the saved value was measured with, with no model
+        # running.  For a tuned record the reading from the start of the tune is kept,
+        # but the reading at save time is the one that matches the next START, so the
+        # larger of the two is used: a high baseline only means "do not re-tune yet",
+        # while a low one would trigger a re-tune that is not needed.
+        cur_free = _free_ram_reading(mode="max")
+        tuned_free = rec.get("free_ram_mib_at_tune")
+        if not isinstance(tuned_free, (int, float)):
+            tuned_free = cur_free
+        elif isinstance(cur_free, (int, float)):
+            tuned_free = max(tuned_free, cur_free)
+        rec["free_ram_mib_at_tune"] = tuned_free
+        if "layers" not in rec:
+            rec["layers"] = _auto_layers(p)
+        # One automatic re-tune per hour at most.  Without this, a value that was just
+        # measured can claim that there is even more RAM free and start a second, third
+        # ... re-tune.  Each one loads the model several times and takes minutes.
+        rec["retune_lock_until"] = time.time() + (AUTO_RETUNE_COOLDOWN_S if meta
+                                                   else AUTO_STEPDOWN_COOLDOWN_S)
         if note:
             rec["note"] = note
         AUTO_CACHE[key] = rec
@@ -1875,6 +2029,10 @@ class App(tk.Tk):
             self._set_run_state("stopped")
             return
         new = lower[0]
+        # Wait for the dead server's memory to come back before the free RAM is read.
+        # Reading it too early gives a number that is far too low, and the next START
+        # then reads a normal number and thinks the machine got a lot faster.
+        self._wait_ram()
         saved = self._save_record(p, new, note=f"lowered from {cur} after OOM in real use")
         self._log(f"[auto ngl] OOM at -ngl {cur} in real use -> saved -ngl {new} ({saved}); restarting")
         self.choice.set(p["name"])
@@ -1970,17 +2128,24 @@ class App(tk.Tk):
         p = self._selected()
         rec = _auto_record(p)
         mismatch = _sampling_mismatch(rec, self.sampling_mode.get())
-        if _auto_applies(p) and _auto_key(p) is not None and (rec is None or _auto_is_stale(p, rec) or mismatch):
+        if _auto_applies(p) and _auto_key(p) is not None:
             if rec is None:
                 self._begin_tuning(p)               # first run for this model/ctx/KV: tune, then start
-            elif mismatch:
+                return
+            if mismatch:
                 self._log(f"[auto ngl] saved -ngl {rec['ngl']} was tuned with different sampling "
                           f"settings, retuning for the new ones")
                 self._begin_tuning(p, reason=f"saved -ngl {rec['ngl']} was tuned with other sampling, retuning")
-            else:
+                return
+            if _auto_is_stale(p, rec):
                 self._log(f"[auto ngl] saved -ngl {rec['ngl']} is stale: free RAM dropped since tuning, retuning")
                 self._begin_tuning(p, reason=f"saved -ngl {rec['ngl']} is stale, retuning")
-            return
+                return
+            if _auto_is_pessimistic(p, rec):
+                self._log(f"[auto ngl] saved -ngl {rec['ngl']} was tuned with less RAM free than now. "
+                          f"More GPU layers may fit, retuning.")
+                self._begin_tuning(p, reason=f"more free RAM than at tuning time, retuning for a higher -ngl")
+                return
         cmd = self._build_cmd()
         port_value = self.port.get().strip() or DEFAULT_PORT
         try:
@@ -2077,8 +2242,21 @@ class App(tk.Tk):
                          if cache else "")
                 self._log(f"[start] only {free:,.0f} MiB of RAM is free, but this model needs about "
                           f"{need:,.0f} MiB for the weights and the chat memory alone, before any GPU "
-                          f"layers.{extra} Close some apps or flush the file cache, or the server will "
-                          f"run out of memory.")
+                          f"layers.{extra}")
+                self._log("[start] The server will still start, but most of the model will run on the "
+                          "processor, so it will be slow. What actually helps:")
+                hints = []
+                lighter = _lighter_preset_for(p)
+                if lighter:
+                    hints.append(f"preset '{lighter[0]}' runs the same model with a smaller context "
+                                 f"({lighter[1]:,} tokens)")
+                if cache >= 1024:
+                    hints.append(f"a lower --cache-ram ({cache} -> 512) frees up to {cache - 512:,.0f} MiB "
+                                 f"of host RAM for the weights")
+                hints.append("closing apps: the file cache flush on its own frees very little when the "
+                             "RAM is held by open programs, not by the cache")
+                for h in hints:
+                    self._log(f"[start]   - {h}")
         except Exception:
             pass
 

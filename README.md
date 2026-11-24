@@ -4,20 +4,16 @@ Run local AI on a normal 16 GB laptop. No cloud. No API key. No subscription.
 
 This launcher starts llama-server.exe on your own laptop. Your prompts stay on your laptop. It works without internet.
 
+Repository: https://github.com/rsvikas/llama-launcher-for-16gb-ram
+
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
-
 [Model loaded in launcher](screenshot-loaded.png)
-
 [Model running log](screenshot-log.png)
-
 [PC memory usage breakdown](screenshot-memory.png)
-
 [Localhost chat screen](screenshot-chat.png)
-
 [LLM response on localhost chat](screenshot-response.png)
-
 [Log screen in Launcher](screenshot-running.png)
 
 ## Demo Video
@@ -84,7 +80,7 @@ The first line of the log tells you which copy of the launcher you are running, 
 - The version line gives the version, the full path of the file you are running, the folder it reads models from, and how many presets it has. The same version is in the window title.
 - It also names the llama.cpp release you are running, because that is what decides which options the server accepts.
 - If another copy of the launcher is on disk and it is a **different version**, it says so and names that version. A copy of the same version is harmless and is not reported. Copies of different versions share the same `auto_ngl.json` but compute different keys, so they keep re-tuning each other and overwriting the saved values. Keep one copy.
-- If there is not enough free RAM for the weights and the chat memory of the model you picked, it says so before the server starts, instead of letting it run out of memory halfway through a request.
+- If there is not enough free RAM for the weights and the chat memory of the model you picked, it says so before the server starts, instead of letting it run out of memory halfway through a request. It also names the lighter preset that runs the same model with a smaller context, and points at `--cache-ram`, because flushing the file cache frees very little when the memory is held by open apps rather than by the cache.
 
 ## Models already in the launcher
 
@@ -123,6 +119,7 @@ These presets are already in `llama_launcher.pyw`. You download the GGUF files y
 
 Notes:
 - Bonsai 2 runs on stock llama.cpp only. Only the Q2_0 pack runs here. There is no PrismML fork.
+- The Bonsai 2 27B has 64 layers. On the Radeon 780M tested here it settles at about 19 layers on the graphics chip, and 20 does not fit. That ceiling comes from the graphics chip's own memory pool (the UMA frame buffer the driver reserves out of system RAM), not from the amount of free system RAM: adding 2 GB of free RAM did not move it. If you want more layers, raise the UMA frame buffer size in the BIOS / AMD graphics settings. The Memory tab shows the pool size.
 - The image, video and audio presets need their mmproj file as well as the model file. Without the projector the preset still runs, but as text only, and it says "(no mmproj: text-only)" in the dropdown.
 - Ultravox uses the same weights file as Llama 3.1. The projector is what makes it Ultravox.
 - OLMoE uses ctx 4096, which is its official max context. No cut was made.
@@ -177,8 +174,13 @@ You do not need to set NGL by hand. The launcher does it for you:
 4. It waits for RAM to settle between trials and restarts. A killed server gives its Vulkan shared memory back slowly. Starting too early makes the next trial fail too low.
 5. A trial that fails without a clear out-of-memory message is treated as "too high", not as a broken setup. That covers the case where the server dies mid-request and the client only sees a dropped connection. The climb keeps the last value that worked instead of throwing the whole tuning run away.
 6. It picks the highest NGL that loads and answers, and saves it in `auto_ngl.json`.
+6b. The winner is tried **one more time** before it is saved. A trial can pass in a lucky moment - the file cache is in a different state, the machine is a little quieter - and then the very same value runs out of memory in real use, where the answer in progress gets cancelled. The re-check costs one extra model load and catches that in advance.
+6c. **One layer of headroom is kept.** The highest value that passes is always directly under a value that failed, so it sits at the edge of what the machine can hold - and the edge is where real requests fall over, because the machine is in a different state by then. So the saved value is one layer below the winner, never below the coarse floor that was tested. One layer out of 64 is about 1.5% of the offloaded work, and the generation speed is set by the layers still on the processor anyway. The winner is written to `auto_ngl.json` as `ceiling_ngl`, so you can see both numbers.
 7. The saved value is tied to model file + size + mtime + ctx + KV type + batch sizes + cache-ram + mmproj. If you reconvert the file or change cache-ram or ctx, it retunes. NGL itself is not part of the key, it is the value being tuned.
 8. Next time you start the same preset, it uses the saved NGL directly. No re-test, unless free RAM has dropped by 1536 MiB since tuning, or you have changed the sampling mode (see point 11). Then it retunes by itself.
+8b. It also re-tunes when a lot **more** RAM is free than when the value was tuned (4096 MiB more). Without this, the value written by the out-of-memory step-down in point 9 would stay low for ever, even after you close the apps that caused the out-of-memory in the first place. Free RAM is read three times and the lowest reading is used, because the Windows file cache alone moves that number by more than a gigabyte when a big model file is read or trimmed. The number the saved value is compared against is the **highest** of those samples, taken after the memory of a killed server has come back - otherwise a slow drain looks like the machine getting faster.
+8c. Every saved value keeps the free RAM it was measured with, including the ones written by the step-down in point 9. Without that number the check in point 8 could never fire again for that preset.
+8d. A value that was just tuned is locked for an hour, and a value that was just lowered after an out-of-memory error (point 9) is locked for ten minutes. Without the lock, a value that has just been measured can claim that there is even more RAM free and start a second, third and fourth re-tune, and each one loads the model several times.
 9. If out of memory happens in real use, not just in tuning, it drops by 1, saves that new value, and restarts by itself. If it is already at 0, it stops and asks you to lower the context or free RAM.
 10. If the server is killed by the graphics driver and prints no out-of-memory message at all, the exit code is the tell. The launcher treats that as too many GPU layers and steps down, instead of leaving you with a dead server.
 11. The sampling mode is remembered with the saved value. The sampler is part of the memory footprint, so switching between modes re-tunes that one preset rather than reusing a number that was measured with different settings.
