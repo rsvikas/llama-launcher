@@ -119,7 +119,7 @@ These presets are already in `llama_launcher.pyw`. You download the GGUF files y
 
 Notes:
 - Bonsai 2 runs on stock llama.cpp only. Only the Q2_0 pack runs here. There is no PrismML fork.
-- The Bonsai 2 27B has 64 layers. On the Radeon 780M tested here it settles at about 19 layers on the graphics chip, and 20 does not fit. That ceiling comes from the graphics chip's own memory pool (the UMA frame buffer the driver reserves out of system RAM), not from the amount of free system RAM: adding 2 GB of free RAM did not move it. If you want more layers, raise the UMA frame buffer size in the BIOS / AMD graphics settings. The Memory tab shows the pool size.
+- The Bonsai 2 27B has 64 layers. On the Radeon 780M tested here it settles at about 19-20 layers on the graphics chip. The limit is how much RAM is free, not a fixed pool inside the graphics chip: with more free RAM the ceiling moves up. **The BIOS UMA frame buffer size is not the lever.** On this laptop the UMA buffer is carved out of system RAM, so raising it takes the same RAM away from Windows and from the model - setting it to 2 GB cost 2 GB of free RAM and the launcher ran out of memory sooner. Leave it at 512 MB.
 - The image, video and audio presets need their mmproj file as well as the model file. Without the projector the preset still runs, but as text only, and it says "(no mmproj: text-only)" in the dropdown.
 - Ultravox uses the same weights file as Llama 3.1. The projector is what makes it Ultravox.
 - OLMoE uses ctx 4096, which is its official max context. No cut was made.
@@ -196,6 +196,7 @@ If auto-tune fails at every NGL, it shows an error. It does not silently fall ba
 - Weights show the file size before start. After start, the split between graphics and processor comes from the llama.cpp log when the build prints buffer sizes. Builds that do not print them show the file size and estimate the split from GPU memory minus weights and KV, and the tab says so.
 - KV cache is memory for this chat. It grows as the chat grows.
 - Prompt cache is saved work from old questions. If you ask the same thing again, it uses the saved work, so it is faster. On an integrated GPU this row measures host RAM growth, so it can read 0 even though the cache is filling up in shared graphics memory.
+- `--cache-ram` is the limit for that prompt cache, in **host RAM**. It is a cap, not an upfront allocation: the memory is used as you actually chat, and only up to the limit. But every megabyte of it is a megabyte the model cannot keep resident, so on a small machine a large `--cache-ram` lowers the number of layers that fit and can end the chat with an out-of-memory error. It is a llama.cpp server setting, not something a model publisher specifies - the publisher values in this launcher are the sampler ones. `--cache-ram 512` is a good default on a 16 GB laptop; raise it only if you re-ask the same long documents often and the speedup is worth the memory.
 - Compute buffers are rough work for reading your question. Bigger batch is faster but needs more memory.
 - The launcher only kills its own server on Stop. It never kills another llama-server.exe on the machine.
 - "Clear RAM" flushes the Windows file cache. It needs admin. Use the "Restart as Admin" button once to enable the full flush.
