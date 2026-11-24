@@ -26,7 +26,7 @@ Watch the launcher running a model locally on a 16GB laptop:
 
 [Watch on YouTube - Llama Launcher running locally](https://youtu.be/cI4puBlCPvg)
 
-[Watch on YouTube - Second demo](https://youtu.be/HWK1HUrWzf0)
+[Watch on YouTube - Qwen MoE demo](https://youtu.be/HWK1HUrWzf0)
 
 ## What is inside this repo
 
