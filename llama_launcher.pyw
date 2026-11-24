@@ -29,6 +29,9 @@ from tkinter import ttk, messagebox
 BASE_DIR = r"C:\prism-llama"
 DEFAULT_PORT = "8080"
 NO_WINDOW = 0x08000000
+# Bump this whenever the launcher changes, so the window title and the first log
+# line always say which copy is running and where it looks for the models.
+APP_VERSION = "2026-11-24.4"
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -315,6 +318,9 @@ COMPONENTS = [
     ("cache", "Prompt cache / growth", "#72b7b2", "Saved work from old questions. Updated below."),
     ("other", "Other host RAM", "#b0b0b0", "The app's own memory. Updated below."),
 ]
+# Short names for the stacked bar. The long ones above are for the table under it.
+BAR_NAMES = {"model": "Weights", "kv": "KV", "rs": "RS", "compute": "Compute",
+             "output": "Output", "cache": "Cache", "other": "Other"}
 
 class MEMORYSTATUSEX(ctypes.Structure):
     _fields_ = [
@@ -980,7 +986,7 @@ def auto_tune_ngl(p, port, out, cancel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Llama Launcher")
+        self.title(f"Llama Launcher {APP_VERSION}")
         self.geometry("940x800")
         self.minsize(700, 480)
         self.proc = None
@@ -1004,6 +1010,9 @@ class App(tk.Tk):
         self.choice = tk.StringVar(value=PRESETS[0]["name"])
         self._build_ui()
         self._set_status("Stopped", "#888888")
+        # First line of every run: which copy is this, and where does it look.
+        self._log(f"[launcher] version {APP_VERSION} | file: {os.path.abspath(__file__)} | "
+                  f"BASE_DIR: {BASE_DIR} | {len(PRESETS)} presets")
         for notice in STARTUP_NOTICES:
             self._log(notice)
         if not os.path.isfile(os.path.join(BASE_DIR, "llama-server.exe")):
@@ -1130,6 +1139,10 @@ class App(tk.Tk):
                              f"memory. Lower -c, lower -b/-ub, or offload fewer layers (-ngl).")
 
     def _build_mem_tab(self, parent):
+        try:
+            self._bar_font = tk.font.Font(font=("Segoe UI", 8, "bold"))
+        except Exception:
+            self._bar_font = None
         canvas = tk.Canvas(parent, highlightthickness=0)
         vbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vbar.set)
@@ -1558,7 +1571,6 @@ class App(tk.Tk):
             c.create_text(w / 2, 17, text="Pick a preset to see its weights and KV estimate", fill="#777")
             return
         colors = {k: col for k, _, col, _ in COMPONENTS}
-        names = {k: n for k, n, _, _ in COMPONENTS}
         x = 1
         for k in order:
             v = best.get(k, 0)
@@ -1566,9 +1578,20 @@ class App(tk.Tk):
                 continue
             seg = (w - 2) * v / total
             c.create_rectangle(x, 1, x + seg, 34, fill=colors[k], outline="white")
-            if seg > 70:
-                c.create_text(x + seg / 2, 17, text=names[k], fill="white", font=("Segoe UI", 8, "bold"))
+            # Only write the name if it really fits. A long name in a narrow
+            # segment used to be cut off mid-word ("Compute buffe").
+            label = BAR_NAMES.get(k, k)
+            if self._bar_fits(label, seg):
+                c.create_text(x + seg / 2, 17, text=label, fill="white", font=("Segoe UI", 8, "bold"))
             x += seg
+
+    def _bar_fits(self, label, seg):
+        """True if the text fits inside a segment of that width."""
+        try:
+            need = self._bar_font.measure(label) + 8
+        except Exception:
+            need = len(label) * 7          # rough fallback
+        return need <= seg
 
     # ---------------- AUTO NGL (driven by START) ----------------
     def _begin_tuning(self, p, reason="no saved value yet"):
@@ -1773,6 +1796,7 @@ class App(tk.Tk):
         if not os.path.isfile(os.path.join(BASE_DIR, os.path.basename(model))):
             messagebox.showerror("Model not found", f"{os.path.join(BASE_DIR, model)} does not exist.")
             return
+        self._ram_warning(p)
         self._stop_process()
         self._wait_ram()
         self.gen += 1
@@ -1802,6 +1826,49 @@ class App(tk.Tk):
             self.q.put((gen, "line", line))
         proc.wait()
         self.q.put((gen, "exit", proc.returncode))
+
+    def _ram_warning(self, p):
+        """Warn only when the model cannot fit in free RAM at all.
+
+        Auto NGL can lower the GPU layers, but the weights and the chat memory
+        are always there, so those are the fixed cost. The prompt cache is a cap
+        that fills up as you chat, not an upfront allocation, so it is not
+        counted here. Being wrong in the direction of "warns anyway" makes the
+        warning useless, so it stays quiet unless the model really cannot fit.
+        """
+        try:
+            free = _free_ram_mib()
+            if free is None:
+                return
+            a = p["args"]
+
+            def val(flag, default=None):
+                return a[a.index(flag) + 1] if flag in a else default
+
+            rel = val("-m")
+            if not rel:
+                return
+            path = os.path.join(BASE_DIR, os.path.basename(rel))
+            if not os.path.isfile(path):
+                return
+            need = os.path.getsize(path) / 1024 ** 2          # the weights, always resident
+            try:
+                info = read_gguf_info(path)
+                kv = estimate_kv_mib(info, int(val("-c", 4096) or 4096),
+                                     val("-ctk", "f16"), val("-ctv", "f16")) or 0
+            except Exception:
+                kv = 0
+            need += kv + 512                                  # chat memory + a little overhead
+            if free < need:
+                cache = int(val("--cache-ram", 2048) or 0)
+                extra = (f" Its prompt cache can take up to {cache:,.0f} MiB more as you chat."
+                         if cache else "")
+                self._log(f"[start] only {free:,.0f} MiB of RAM is free, but this model needs about "
+                          f"{need:,.0f} MiB for the weights and the chat memory alone, before any GPU "
+                          f"layers.{extra} Close some apps or flush the file cache, or the server will "
+                          f"run out of memory.")
+        except Exception:
+            pass
 
     def _wait_ram(self):
         """Wait until the freed memory of the previous server is really back.
