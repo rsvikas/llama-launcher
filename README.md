@@ -7,20 +7,26 @@ This launcher starts llama-server.exe on your own laptop. Your prompts stay on y
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
+
 [Model loaded in launcher](screenshot-loaded.png)
+
 [Model running log](screenshot-log.png)
+
 [PC memory usage breakdown](screenshot-memory.png)
+
 [Localhost chat screen](screenshot-chat.png)
+
 [LLM response on localhost chat](screenshot-response.png)
+
 [Log screen in Launcher](screenshot-running.png)
 
 ## Demo Video
 
 Watch the launcher running a model locally on a 16GB laptop:
 
-[Watch on YouTube - Llama Launcher running locally](https://youtu.be/cI4puBlCPvg)
+[Watch on YouTube - Llama Launcher running locally](https://youtu.be/HWK1HUrWzf0)
 
-[Watch on YouTube - Second demo](https://youtu.be/HWK1HUrWzf0)
+[Watch on YouTube - Qwen MoE demo](https://youtu.be/cI4puBlCPvg)
 
 ## What is inside this repo
 
