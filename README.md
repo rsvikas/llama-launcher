@@ -4,29 +4,25 @@ Run local AI on a normal 16 GB laptop. No cloud. No API key. No subscription.
 
 This launcher starts llama-server.exe on your own laptop. Your prompts stay on your laptop. It works without internet.
 
+Repository: https://github.com/rsvikas/llama-launcher-for-16gb-ram
+
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
-
 [Model loaded in launcher](screenshot-loaded.png)
-
 [Model running log](screenshot-log.png)
-
 [PC memory usage breakdown](screenshot-memory.png)
-
 [Localhost chat screen](screenshot-chat.png)
-
 [LLM response on localhost chat](screenshot-response.png)
-
 [Log screen in Launcher](screenshot-running.png)
 
 ## Demo Video
 
 Watch the launcher running a model locally on a 16GB laptop:
 
-[Watch on YouTube - Llama Launcher running locally](https://youtu.be/HWK1HUrWzf0)
+[Watch on YouTube - Llama Launcher running locally](https://youtu.be/cI4puBlCPvg)
 
-[Watch on YouTube - Qwen MoE demo](https://youtu.be/cI4puBlCPvg)
+[Watch on YouTube - Second demo](https://youtu.be/HWK1HUrWzf0)
 
 ## What is inside this repo
 
@@ -78,6 +74,12 @@ With Exa MCP: current info works, up to 150 free calls per day.
 4. Double click llama_launcher.pyw, pick a preset, press START. Open http://127.0.0.1:8080
 
 The first line of the log tells you which copy of the launcher you are running, where that copy is, and which folder it reads models from. The window title carries the same version number. If you keep more than one copy, this line tells you which one is live.
+
+## What the launcher checks when it starts
+
+- The version line gives the version, the full path of the file you are running, the folder it reads models from, and how many presets it has. The same version is in the window title.
+- If another copy of the launcher is on disk and it is a **different version**, it says so and names that version. A copy of the same version is harmless and is not reported. Copies of different versions share the same `auto_ngl.json` but compute different keys, so they keep re-tuning each other and overwriting the saved values. Keep one copy.
+- If there is not enough free RAM for the weights and the chat memory of the model you picked, it says so before the server starts, instead of letting it run out of memory halfway through a request.
 
 ## Models already in the launcher
 

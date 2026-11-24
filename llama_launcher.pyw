@@ -31,7 +31,7 @@ DEFAULT_PORT = "8080"
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-24.4"
+APP_VERSION = "2026-11-24.5"
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -609,6 +609,45 @@ def _first_oom(lines):
     return None
 
 
+def _copy_version(path):
+    """Read APP_VERSION out of another copy of the launcher, if it has one."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', f.read())
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def _other_launcher_copies():
+    """Find other copies of this launcher that would fight over auto_ngl.json.
+
+    Every copy with the same BASE_DIR shares the same auto_ngl.json. Copies of
+    the same version compute the same keys, so they are harmless. A copy of a
+    different version computes different keys, so the two keep re-tuning each
+    other and overwriting the saved values. Only those are reported.
+    """
+    try:
+        me = os.path.abspath(__file__)
+    except Exception:
+        return []
+    found = []
+    for folder in (BASE_DIR, os.path.dirname(me)):
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            continue
+        for name in names:
+            low = name.lower()
+            if not (low.startswith("llama_launcher") and low.endswith(".pyw")):
+                continue
+            path = os.path.abspath(os.path.join(folder, name))
+            if path == me or path in found:
+                continue
+            other = _copy_version(path)
+            if other != APP_VERSION:
+                found.append((path, other))
+    return found
+
 def _auto_applies(p):
     """All llama-server presets with -ngl. No model is excluded."""
     return p["exe"] == "llama-server.exe" and "-ngl" in p["args"] and "-m" in p["args"]
@@ -1013,6 +1052,13 @@ class App(tk.Tk):
         # First line of every run: which copy is this, and where does it look.
         self._log(f"[launcher] version {APP_VERSION} | file: {os.path.abspath(__file__)} | "
                   f"BASE_DIR: {BASE_DIR} | {len(PRESETS)} presets")
+        others = _other_launcher_copies()
+        if others:
+            listed = ", ".join(f"{p} (version {v})" if v else f"{p} (older, no version marker)"
+                               for p, v in others)
+            self._log(f"[launcher] WARNING: other copies of this launcher are on disk: {listed}. "
+                      f"They share the same auto_ngl.json and, being a different version, they would "
+                      f"re-tune each other. Keep only the copy you are running.")
         for notice in STARTUP_NOTICES:
             self._log(notice)
         if not os.path.isfile(os.path.join(BASE_DIR, "llama-server.exe")):
