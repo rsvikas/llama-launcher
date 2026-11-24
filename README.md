@@ -7,24 +7,20 @@ This launcher starts llama-server.exe on your own laptop. Your prompts stay on y
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
-
 [Model loaded in launcher](screenshot-loaded.png)
-
-[Model running log](screenshot-running.png)
-
+[Model running log](screenshot-log.png)
 [PC memory usage breakdown](screenshot-memory.png)
-
 [Localhost chat screen](screenshot-chat.png)
-
 [LLM response on localhost chat](screenshot-response.png)
-
-[Log screen in Launcher](screenshot-log.png)
+[Log screen in Launcher](screenshot-running.png)
 
 ## Demo Video
 
 Watch the launcher running a model locally on a 16GB laptop:
 
-[Watch on YouTube - Llama Launcher running locally](https://youtu.be/HWK1HUrWzf0)
+[Watch on YouTube - Llama Launcher running locally](https://youtu.be/cI4puBlCPvg)
+
+[Watch on YouTube - Second demo](https://youtu.be/HWK1HUrWzf0)
 
 ## What is inside this repo
 
@@ -81,8 +77,8 @@ These presets are already in `llama_launcher.pyw`. You only need to download the
 
 | Preset | File you need to download | Use |
 | --- | --- | --- |
-| Bonsai 2 27B Thinking, Low memory, Instruct | Ternary-Bonsai-2-27B-PQ2_0.gguf or PTQ1_0.gguf or Q2_0 file | Thinking, instruct |
-| Bonsai 2 9B Thinking, Instruct, Images | Ternary-Bonsai-2-9B-PQ2_0.gguf or PTQ1_0.gguf or Q2_0 file | Thinking, instruct, images |
+| Bonsai 2 27B Thinking, Low memory, Instruct | Ternary-Bonsai-2-27B-Q2_0.gguf only | Thinking, instruct, stock llama.cpp only, no PrismML fork |
+| Bonsai 2 9B Thinking, Instruct, Images | Ternary-Bonsai-2-9B-Q2_0.gguf only | Thinking, instruct, images, stock llama.cpp only, no PrismML fork, images is chat only, not Cline |
 | Gemma 4 E4B Reasoning OFF and ON | gemma-4-E4B_q4_0-it.gguf | General chat |
 | Gemma 4 E4B Vision | gemma-4-E4B_q4_0-it.gguf + mmproj file | Chat with images |
 | Qwen3 8B Thinking, Non-Thinking | Qwen3-8B-Q4_K_M.gguf | General chat |
@@ -95,12 +91,19 @@ These presets are already in `llama_launcher.pyw`. You only need to download the
 | Qwen2.5-Coder 14B Q4_K_M | qwen2.5-coder-14b-instruct-q4_k_m.gguf | Coding, partial GPU |
 | MiMo-V2.6-Distill-Qwen-9B Q4_K_M and Q8_0 | MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf or Q8_0.gguf | Agentic |
 | Qwen3.5-9B | Qwen3.5-9B-Q4_K_M-OFFICIAL.gguf | General, non-thinking |
-| Nemotron 3 Nano 4B | Nemotron3-Nano-4B-Q4_K_M.gguf | Reasoning |
+| Nemotron 3 Nano 4B | NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf | Reasoning |
 | Nemotron-Nano-9B-v2 | Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf | Reasoning |
 | DeepSeek-R1-Distill-Qwen-7B | DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf | Reasoning |
 | Ministral 3 8B Instruct | Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf | General |
+| OLMoE 1B-7B Q6_K | OLMoE-Q6_K.gguf | MoE chat, 64 experts, 8 active |
+| Qwen1.5-MoE-A2.7B-Chat Q3_K_M | Qwen-MoE-Q3_K_M.gguf | MoE chat, 60 experts, 4 active, ctx 2048 (4096 needs ~9 GB free) |
 
-If a preset says (no mmproj: text-only), it will still run as text only. Add the mmproj file to get images or audio.
+Notes:
+- Bonsai 2 runs on stock llama.cpp only. Only the Q2_0 pack runs here. There is no PrismML fork.
+- If a preset says (no mmproj: text-only), it will still run as text only. Add the mmproj file to get images or audio.
+- Ultravox uses the same weights file as Llama 3.1. The projector is what makes it Ultravox.
+- OLMoE uses ctx 4096, which is its official max context. No cut was made.
+- Qwen1.5-MoE official max is 32768, but that OOMs at this file size on a 7-9 GB laptop. 2048 is the context that runs. 4096 is kept as a variant that needs about 9 GB free.
 
 ## If your model is not in this list
 
@@ -110,7 +113,7 @@ You need to add one line in the launcher. Downloading a model is not enough.
 2. Find `PRESETS = [`.
 3. Copy one similar line and change it. Example for a new Qwen model:
 
-```python
+```
 preset("My model | GENERAL", "My-Model-Q4_K_M.gguf", ctx(8192) + KV + QWEN_SAMPLING + REASONING_OFF),
 ```
 
@@ -125,18 +128,46 @@ All the models in the list above are models I have tested myself on this 16 GB l
 
 All presets are official presets. That means the settings are taken from the official publisher page and the official ggml-org file, not guessed. If the publisher says temperature 0.6 and top-p 0.95, the launcher uses 0.6 and 0.95. If the publisher says a model needs a mmproj file for images, the launcher asks for that mmproj file. You do not need to search for settings.
 
+If a publisher publishes no fixed sampling table, the preset says so instead of pretending one exists. Example: OLMoE has no fixed table, so it uses standard chat values and says so.
+
+### Reasoning is set explicitly
+
+Every preset sets reasoning ON or OFF clearly. Auto is not used. Auto is not neutral: it turns thinking ON for every template that supports it, even when the template itself defaults it to false.
+
+### Missing files are not hidden
+
+Presets stay visible even if the file is missing. The launcher shows what is missing and why it will fail, instead of hiding the preset.
+
 ### Auto NGL is already set up
 
 NGL means how many layers of the model go to the GPU. More layers on GPU = faster. Too many layers = out of memory and crash.
 
 You do not need to set NGL by hand. The launcher does it for you:
 
-1. On first run for a preset, it tries different NGL values, one by one.
-2. It checks how much GPU memory is free and if the model loads without error.
-3. It picks the highest NGL that fits safely and saves it in `auto_ngl.json`.
-4. Next time you start the same preset, it uses the saved NGL directly. No re-test.
+1. On first run for a preset, it tries coarse values first, then climbs with binary search to the highest working value. Example for a 36-layer model: `[37, 36, 32, 16, 8, 4, 0]`. 37 means layers + 1 for full offload. Fine values like 24 or 20 are found by the climb, not by trying every value.
+2. Each trial is a real load + real generation with a long prompt, about 75% of the context, not just a load check. This is where decode OOM shows up.
+3. If file + KV + cache-ram + 1 GB reserve is bigger than free RAM, it skips the top trial and starts lower. The climb will still try higher if it actually works.
+4. It waits for RAM to settle between trials and restarts. A killed server gives its Vulkan shared memory back slowly. Starting too early makes the next trial fail too low.
+5. It picks the highest NGL that loads and answers, and saves it in `auto_ngl.json`.
+6. The saved value is tied to model file + size + mtime + ctx + KV type + batch sizes + cache-ram + mmproj. If you reconvert the file or change cache-ram or ctx, it retunes. NGL itself is not part of the key, it is the value being tuned.
+7. Next time you start the same preset, it uses the saved NGL directly. No re-test, unless free RAM has dropped by 1536 MiB since tuning. Then it retunes by itself.
+8. If out of memory happens in real use, not just in tuning, it drops by 1, saves that new value, and restarts by itself. If it is already at 0, it stops and asks you to lower the context or free RAM.
+9. Old saved entries for the same model + ctx + mmproj that are no longer live are cleaned when a new value is saved.
 
-If you change your GPU driver, or you want to test again, just delete `auto_ngl.json` and start the launcher again. It will auto-tune again. If auto-tune fails, it falls back to a safe low NGL so the model still starts on CPU.
+If you change your GPU driver, or you want to test again, just delete `auto_ngl.json` and start the launcher again. It will auto-tune again.
+
+If auto-tune fails at every NGL, it shows an error. It does not silently fall back to CPU.
+
+## Memory breakdown, Clear RAM, and Cleaner
+
+- The Memory breakdown tab shows: Model weights, KV cache, Recurrent state, Compute buffers, Output buffer, Prompt cache / growth, and Other host RAM.
+- Weights show the file size before start, and measured split after start: how much is on graphics, how much is on processor.
+- KV cache is memory for this chat. It grows as the chat grows.
+- Prompt cache is saved work from old questions. If you ask the same thing again, it uses the saved work, so it is faster.
+- Compute buffers are rough work for reading your question. Bigger batch is faster but needs more memory.
+- The launcher only kills its own server on Stop. It never kills another llama-server.exe on the machine.
+- "Clear RAM" flushes the Windows file cache. It needs admin. Use the "Restart as Admin" button once to enable the full flush.
+- "Cleaner" lets you select apps and trim their working sets. Trimming a running llama-server will slow generation, so it asks first.
 
 ## Can I reuse this as is?
 
