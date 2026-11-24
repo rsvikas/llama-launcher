@@ -4,8 +4,6 @@ Run local AI on a normal 16 GB laptop. No cloud. No API key. No subscription.
 
 This launcher starts llama-server.exe on your own laptop. Your prompts stay on your laptop. It works without internet.
 
-Repository: https://github.com/rsvikas/llama-launcher-for-16gb-ram
-
 ## Screenshots
 
 [List of models in Launcher](screenshot-models.png)
