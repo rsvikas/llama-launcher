@@ -78,6 +78,7 @@ The first line of the log tells you which copy of the launcher you are running, 
 ## What the launcher checks when it starts
 
 - The version line gives the version, the full path of the file you are running, the folder it reads models from, and how many presets it has. The same version is in the window title.
+- It also names the llama.cpp release you are running, because that is what decides which options the server accepts.
 - If another copy of the launcher is on disk and it is a **different version**, it says so and names that version. A copy of the same version is harmless and is not reported. Copies of different versions share the same `auto_ngl.json` but compute different keys, so they keep re-tuning each other and overwriting the saved values. Keep one copy.
 - If there is not enough free RAM for the weights and the chat memory of the model you picked, it says so before the server starts, instead of letting it run out of memory halfway through a request.
 
@@ -85,29 +86,36 @@ The first line of the log tells you which copy of the launcher you are running, 
 
 These presets are already in `llama_launcher.pyw`. You download the GGUF files yourself and put them in `C:\prism-llama`.
 
-| Preset | File you need to download | Use |
+| Preset in the dropdown | File you need to download | Use |
 | --- | --- | --- |
-| Bonsai 2 27B Thinking, Low memory, Instruct | Ternary-Bonsai-2-27B-Q2_0.gguf only | Thinking, instruct, stock llama.cpp only, no PrismML fork |
-| Bonsai 2 9B Thinking, Instruct | Ternary-Bonsai-2-9B-Q2_0.gguf only | Thinking, instruct, stock llama.cpp only, no PrismML fork |
-| Bonsai 2 9B Images | Ternary-Bonsai-2-9B-Q2_0.gguf + Ternary-Bonsai-2-9B-mmproj-Q8_0.gguf | Images, thinking, chat only, not Cline |
-| Gemma 4 E4B Reasoning OFF and ON | gemma-4-E4B_q4_0-it.gguf | General chat |
-| Gemma 4 E4B Vision | gemma-4-E4B_q4_0-it.gguf + mmproj file | Chat with images |
-| Qwen3 8B Thinking, Non-Thinking | Qwen3-8B-Q4_K_M.gguf | General chat |
-| Llama 3.1 8B | Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf | General chat |
-| Qwen2.5-VL 7B Vision | Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf + mmproj file | Chat with images |
-| Ultravox audio | Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf + mmproj file | Audio, experimental |
-| Qwen3-ASR 1.7B | Qwen3-ASR-1.7B-Q8_0.gguf + mmproj file | Speech to text |
-| SmolVLM2 500M Video | SmolVLM2-500M-Video-Instruct-Q8_0.gguf + mmproj file | Video |
-| Qwen2.5-Coder 7B Q6_K | Qwen2.5-Coder-7B-Instruct-Q6_K.gguf | Coding |
-| Qwen2.5-Coder 14B Q4_K_M | Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf | Coding, partial GPU |
-| MiMo-V2.6-Distill-Qwen-9B Q4_K_M and Q8_0 | MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf or MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf | Agentic |
-| Qwen3.5-9B | Qwen3.5-9B-Q4_K_M-OFFICIAL.gguf | General, non-thinking |
-| Nemotron 3 Nano 4B | NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf | Reasoning |
-| Nemotron-Nano-9B-v2 | Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf | Reasoning |
-| DeepSeek-R1-Distill-Qwen-7B | DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf | Reasoning |
-| Ministral 3 8B Instruct | Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf | General |
-| OLMoE 1B-7B Q6_K | OLMoE-Q6_K.gguf | MoE chat, 64 experts, 8 active |
-| Qwen1.5-MoE-A2.7B-Chat Q3_K_M | Qwen-MoE-Q3_K_M.gguf | MoE chat, 60 experts, 4 active, ctx 2048 (4096 needs ~9 GB free) |
+| 1. Bonsai 2 27B - thinking (8k ctx) | Ternary-Bonsai-2-27B-Q2_0.gguf only | Thinking, stock llama.cpp only, no PrismML fork |
+| 1b. Bonsai 2 27B - thinking (4k ctx, lighter) | Ternary-Bonsai-2-27B-Q2_0.gguf only | Same model, smaller context and batch, for a tight machine |
+| 1c. Bonsai 2 27B - no thinking (8k ctx) | Ternary-Bonsai-2-27B-Q2_0.gguf only | Instruct mode, faster |
+| 2. Bonsai 2 9B - thinking (16k ctx) | Ternary-Bonsai-2-9B-Q2_0.gguf only | Thinking |
+| 2b. Bonsai 2 9B - no thinking (16k ctx) | Ternary-Bonsai-2-9B-Q2_0.gguf only | Instruct mode, faster |
+| 3. Bonsai 2 9B - images + thinking, chat only | Ternary-Bonsai-2-9B-Q2_0.gguf + Ternary-Bonsai-2-9B-mmproj-Q8_0.gguf | Images, thinking. Chat apps only, not agent tools |
+| 4. Gemma 4 E4B - no thinking (24k ctx) | gemma-4-E4B_q4_0-it.gguf | General chat |
+| 4b. Gemma 4 E4B - thinking (24k ctx) | gemma-4-E4B_q4_0-it.gguf | General chat with thinking |
+| 5. Qwen3 8B - thinking (16k ctx) | Qwen3-8B-Q4_K_M.gguf | General chat |
+| 5b. Qwen3 8B - no thinking (16k ctx) | Qwen3-8B-Q4_K_M.gguf | General chat, faster |
+| 6. Llama 3.1 8B - general (8k ctx) | Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf | General chat |
+| 7. Gemma 4 E4B - images (16k ctx) | gemma-4-E4B_q4_0-it.gguf + mmproj file | Chat with images |
+| 8. Qwen2.5-VL 7B - images (8k ctx) | Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf + mmproj file | Chat with images |
+| 9. Ultravox audio - experimental (4k ctx) | Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf + mmproj file | Audio, experimental |
+| 10. Qwen3-ASR 1.7B - speech to text (8k ctx) | Qwen3-ASR-1.7B-Q8_0.gguf + mmproj file | Speech to text |
+| 11. SmolVLM2 500M - video (8k ctx) | SmolVLM2-500M-Video-Instruct-Q8_0.gguf + mmproj file | Video |
+| 12. Qwen2.5-Coder 7B - coding (8k ctx) | Qwen2.5-Coder-7B-Instruct-Q6_K.gguf | Coding |
+| 13. Qwen2.5-Coder 14B - coding, lighter (4k ctx) | qwen2.5-coder-14b-instruct-q4_k_m.gguf | Coding, smaller context |
+| 14. MiMo-V2.6-Distill-Qwen-9B - agentic (8k ctx) | MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf | Agentic |
+| 15. MiMo-V2.6-Distill-Qwen-9B Q8_0 - agentic (2k ctx) | MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf | Agentic, better quality, smaller context |
+| 16. Qwen3.5-9B - no thinking (8k ctx) | Qwen3.5-9B-Q4_K_M-OFFICIAL.gguf | General, no thinking |
+| 17. Nemotron 3 Nano 4B - thinking (64k ctx) | NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf | Reasoning, long context |
+| 18. DeepSeek-R1-Distill-Qwen-7B - thinking (8k ctx) | DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf | Reasoning |
+| 19. Ministral 3 8B - general (8k ctx) | Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf | General |
+| 20. Nemotron-Nano 9B - thinking (4k ctx) | Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf | Reasoning |
+| 21. OLMoE 1B-7B - general (4k ctx) | OLMoE-Q6_K.gguf | MoE chat, 64 experts, 8 active |
+| 22. Qwen1.5-MoE-A2.7B-Chat - general (2k ctx) | Qwen-MoE-Q3_K_M.gguf | MoE chat, 60 experts, 4 active |
+| 22b. Qwen1.5-MoE-A2.7B-Chat - general (4k ctx) | Qwen-MoE-Q3_K_M.gguf | Same model, 4k context, needs about 9 GB free |
 
 Notes:
 - Bonsai 2 runs on stock llama.cpp only. Only the Q2_0 pack runs here. There is no PrismML fork.
@@ -166,9 +174,11 @@ You do not need to set NGL by hand. The launcher does it for you:
 5. A trial that fails without a clear out-of-memory message is treated as "too high", not as a broken setup. That covers the case where the server dies mid-request and the client only sees a dropped connection. The climb keeps the last value that worked instead of throwing the whole tuning run away.
 6. It picks the highest NGL that loads and answers, and saves it in `auto_ngl.json`.
 7. The saved value is tied to model file + size + mtime + ctx + KV type + batch sizes + cache-ram + mmproj. If you reconvert the file or change cache-ram or ctx, it retunes. NGL itself is not part of the key, it is the value being tuned.
-8. Next time you start the same preset, it uses the saved NGL directly. No re-test, unless free RAM has dropped by 1536 MiB since tuning. Then it retunes by itself.
+8. Next time you start the same preset, it uses the saved NGL directly. No re-test, unless free RAM has dropped by 1536 MiB since tuning, or you have changed the sampling mode (see point 11). Then it retunes by itself.
 9. If out of memory happens in real use, not just in tuning, it drops by 1, saves that new value, and restarts by itself. If it is already at 0, it stops and asks you to lower the context or free RAM.
-10. Old saved entries for the same model + ctx + mmproj that are no longer live are cleaned when a new value is saved.
+10. If the server is killed by the graphics driver and prints no out-of-memory message at all, the exit code is the tell. The launcher treats that as too many GPU layers and steps down, instead of leaving you with a dead server.
+11. The sampling mode is remembered with the saved value. The sampler is part of the memory footprint, so switching between modes re-tunes that one preset rather than reusing a number that was measured with different settings.
+12. Old saved entries for the same model + ctx + mmproj that are no longer live are cleaned when a new value is saved.
 
 If you change your GPU driver, or you want to test again, just delete `auto_ngl.json` and start the launcher again. It will auto-tune again.
 
@@ -184,6 +194,36 @@ If auto-tune fails at every NGL, it shows an error. It does not silently fall ba
 - The launcher only kills its own server on Stop. It never kills another llama-server.exe on the machine.
 - "Clear RAM" flushes the Windows file cache. It needs admin. Use the "Restart as Admin" button once to enable the full flush.
 - "Cleaner" lets you select apps and trim their working sets. Trimming a running llama-server will slow generation, so it asks first.
+
+## Reducing hallucinations
+
+Small models blurt. Two different things go wrong, and they need different fixes.
+
+**"It just blurts things out"** is sampling. The model is picking tokens out of the thin tail of the distribution, where confident-sounding but wrong words live. The `Sampling:` dropdown next to the buttons fixes that, by replacing the publisher's sampler with a tighter one:
+
+| Mode | What it does |
+| --- | --- |
+| Normal (publisher settings) | The values from the publisher's own page. Nothing is changed. |
+| Precise (less random) | temperature 0.3, top-k 20, top-p 0.8, min-p 0.05, repeat penalty 1.05. The usual first thing to try. Costs some variety, buys a lot of accuracy. |
+| Deterministic (same answer) | temperature 0. The same question always gives the same answer. That is how you find out whether a change to the prompt actually helped. |
+| Mirostat 2 (steady) | Keeps the perplexity in a fixed band instead of following the model's own confidence. llama.cpp ignores top-k and top-p when Mirostat is on, so they are left out. |
+| Precise + DRY (no repeats) | Precise, plus the DRY sampler that punishes repeating a phrase. Small models loop, and loops read as hallucination. |
+
+The mode replaces the sampler flags, it does not add to them, so it always wins over the publisher's values. The command line at the top of the window shows what is actually being run. Changing the mode does trigger a re-tune: the sampler is part of the memory footprint, so the saved GPU layer count for the old mode is not reused for the new one.
+
+**Changing the mode while a server is running.** The running server keeps the settings it was started with. When you change the mode, the launcher asks whether to restart it, and says plainly that a restart cancels an answer in progress. If you say no, the command line keeps showing a marker so you do not forget:
+
+```
+[sampling changed - the running server still uses the old settings, press RESTART]
+```
+
+Restarting after a mode change re-tunes for the new sampling settings first, so it takes longer than a plain restart. Restarting without changing the mode reuses the saved value, so the server comes back in seconds.
+
+**"It says things that are not true"** is not a sampling problem. A model that does not know has no way to admit it, and no temperature will teach it. The fix is to give it the facts: for anything current or specific, search first (Exa MCP, see above), and for code, let it read the actual file instead of recalling it.
+
+What does not work: asking the model to check its own answer. On a model this size the second pass is usually just as wrong, only longer, and at 2 tokens per second it costs three times the wait. If you want a second opinion, use a second model or a second pass on a bigger machine, not a prompt.
+
+**Where to put the rules.** The llama.cpp web UI has a **System Message** box in its settings. Anything you put there is sent with every request, so the model follows it in every chat, and it survives the web UI's own conversation compaction. That is the right place for "don't guess, quote your source, say I don't know". The launcher cannot set it for you: that depends on your llama.cpp version, and a client that sends its own system message would override it anyway.
 
 ## Can I reuse this as is?
 

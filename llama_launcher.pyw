@@ -31,7 +31,7 @@ DEFAULT_PORT = "8080"
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-24.5"
+APP_VERSION = "2026-11-24.14"
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -70,6 +70,84 @@ BONSAI_INSTRUCT_SAMPLING = ["--jinja", "--temp", "0.7", "--top-p", "0.80", "--to
 
 def think(n):
     return ["--reasoning-budget", str(n)]
+
+# --- Sampling modes -------------------------------------------------------
+# "Publisher" keeps the values the model publisher documents. The other modes
+# are for small models that blurt out confident nonsense. They do one thing:
+# stop the model from picking tokens out of the thin tail of the distribution,
+# where confident-looking but wrong words live.
+#
+#   Precise   : low temperature and a tight nucleus. The usual first thing to
+#               try. Costs some variety, buys a lot of accuracy.
+#   Mirostat  : keeps the perplexity in a fixed band instead of following the
+#               model's own confidence. Note: Mirostat makes llama.cpp ignore
+#               top_k, top_p and typical_p, so they are left out here.
+#   + DRY     : "Don't Repeat Yourself" penalises the model for repeating a
+#               phrase. Small models loop; loops read as hallucination.
+#
+# The flags are REPLACED, not appended, so the chosen mode always wins over the
+# publisher's values.
+SAMPLER_FLAGS = ("--temp", "--temperature", "--top-k", "--top-p", "--min-p",
+                 "--typical", "--typical-p", "--top-n-sigma", "--mirostat",
+                 "--mirostat-lr", "--mirostat-ent", "--dry-multiplier",
+                 "--dry-base", "--dry-allowed-length", "--dry-penalty-last-n",
+                 "--repeat-penalty", "--repeat-last-n", "--presence-penalty",
+                 "--frequency-penalty", "--xtc-probability", "--xtc-threshold",
+                 "--dynatemp-range", "--dynatemp-exp", "--samplers")
+
+PRECISE_SAMPLING = ["--temp", "0.3", "--top-k", "20", "--top-p", "0.8", "--min-p", "0.05",
+                    "--repeat-penalty", "1.05"]
+DETERMINISTIC_SAMPLING = ["--temp", "0.0", "--repeat-penalty", "1.05"]
+MIROSTAT_SAMPLING = ["--mirostat", "2", "--mirostat-lr", "0.1", "--mirostat-ent", "5.0",
+                    "--repeat-penalty", "1.05"]
+DRY_SAMPLING = ["--dry-multiplier", "0.8", "--dry-base", "1.75", "--dry-allowed-length", "2",
+                "--dry-penalty-last-n", "128"]
+SAMPLING_MODES = {
+    "Normal (publisher settings)": None,
+    "Precise (less random)": PRECISE_SAMPLING,
+    "Deterministic (same answer)": DETERMINISTIC_SAMPLING,
+    "Mirostat 2 (steady)": MIROSTAT_SAMPLING,
+    "Precise + DRY (no repeats)": PRECISE_SAMPLING + DRY_SAMPLING,
+}
+
+def apply_sampling_mode(args, mode):
+    """Preset args with the sampling flags replaced by the chosen mode."""
+    flags = SAMPLING_MODES.get(mode)
+    if not flags:
+        return list(args)
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+            continue
+        if a in SAMPLER_FLAGS:
+            skip = True
+            continue
+        out.append(a)
+    return out + list(flags)
+
+
+_VERSION_CACHE = {}
+
+
+def server_version():
+    """The llama.cpp version, one short line, e.g. 'b5678 (2026-05-05)'. Read once."""
+    exe = os.path.join(BASE_DIR, "llama-server.exe")
+    if exe in _VERSION_CACHE:
+        return _VERSION_CACHE[exe]
+    line = ""
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True, text=True,
+                             timeout=25, creationflags=NO_WINDOW)
+        for raw in ((out.stdout or "") + (out.stderr or "")).splitlines():
+            if raw.strip():
+                line = raw.strip()
+                break
+    except Exception:
+        line = ""
+    _VERSION_CACHE[exe] = line
+    return line
+
 
 def resolve_file(name):
     """Return the real on-disk file name in BASE_DIR, matched case-insensitively.
@@ -240,41 +318,41 @@ STARTUP_NOTICES = []
 # Qwen1.5-MoE  https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat        (generation_config.json: 0.7/0.8/20/1.05)
 # llama.cpp CLI  https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
 PRESETS = [
-    preset("1. Bonsai 2 27B  |  THINKING (publisher sampler)", BONSAI_27B_FILE, ctx(8192) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
-    preset("1b. Bonsai 2 27B  |  THINKING, low memory (ctx 4096)", BONSAI_27B_FILE, ctx(4096, b=128, ub=64) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
-    preset("1c. Bonsai 2 27B  |  INSTRUCT, no thinking (publisher sampler)", BONSAI_27B_FILE, ctx(8192) + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
-    preset("2. Bonsai 2 9B  |  THINKING (publisher sampler)", BONSAI_9B_FILE, ctx() + KV + SAMPLING_9B + REASONING_ON + think(-1)),
-    preset("2b. Bonsai 2 9B  |  INSTRUCT, no thinking (publisher sampler)", BONSAI_9B_FILE, ctx() + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
-    preset("3. Bonsai 2 9B  |  IMAGES, thinking (chat only, not Cline)" + ("" if _BONSAI9_MM else " (no mmproj: text-only)"), BONSAI_9B_FILE, ctx(**VISION) + KV + SAMPLING_9B + REASONING_ON + think(-1), mmproj=_BONSAI9_MM),
-    preset("4. Gemma 4 E4B  |  Google sampler, reasoning OFF", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_OFF),
-    preset("4b. Gemma 4 E4B  |  Google sampler, reasoning ON", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_ON),
-    preset("5. Qwen3 8B  |  THINKING (Qwen model-card values)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_SAMPLING + REASONING_ON + think(-1)),
-    preset("5b. Qwen3 8B  |  NON-THINKING (Qwen model-card values)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_NON_THINKING_SAMPLING + REASONING_OFF),
-    preset("6. Llama 3.1 8B  |  Meta generation_config (community GGUF)", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(8192) + KV + LLAMA_SAMPLING),
-    preset("7. Gemma 4 E4B  |  VISION, Google sampler (chat only)" + ("" if _GEMMA_MM else " (no mmproj: text-only)"), "gemma-4-E4B_q4_0-it.gguf", ctx(16384, **VISION) + KV + GEMMA_SAMPLING + REASONING_OFF, mmproj=_GEMMA_MM),
-    preset("8. Qwen2.5-VL 7B  |  VISION (Qwen generation_config)" + ("" if _QWENVL_MM else " (no mmproj: text-only)"), "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + QWENVL_GENCFG_SAMPLING, mmproj=_QWENVL_MM),
+    preset("1. Bonsai 2 27B - thinking (8k ctx)", BONSAI_27B_FILE, ctx(8192) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
+    preset("1b. Bonsai 2 27B - thinking (4k ctx, lighter)", BONSAI_27B_FILE, ctx(4096, b=128, ub=64) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
+    preset("1c. Bonsai 2 27B - no thinking (8k ctx)", BONSAI_27B_FILE, ctx(8192) + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
+    preset("2. Bonsai 2 9B - thinking (16k ctx)", BONSAI_9B_FILE, ctx() + KV + SAMPLING_9B + REASONING_ON + think(-1)),
+    preset("2b. Bonsai 2 9B - no thinking (16k ctx)", BONSAI_9B_FILE, ctx() + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
+    preset("3. Bonsai 2 9B - images + thinking, chat only" + ("" if _BONSAI9_MM else " (text only)"), BONSAI_9B_FILE, ctx(**VISION) + KV + SAMPLING_9B + REASONING_ON + think(-1), mmproj=_BONSAI9_MM),
+    preset("4. Gemma 4 E4B - no thinking (24k ctx)", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_OFF),
+    preset("4b. Gemma 4 E4B - thinking (24k ctx)", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_ON),
+    preset("5. Qwen3 8B - thinking (16k ctx)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_SAMPLING + REASONING_ON + think(-1)),
+    preset("5b. Qwen3 8B - no thinking (16k ctx)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_NON_THINKING_SAMPLING + REASONING_OFF),
+    preset("6. Llama 3.1 8B - general (8k ctx)", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(8192) + KV + LLAMA_SAMPLING),
+    preset("7. Gemma 4 E4B - images (16k ctx)" + ("" if _GEMMA_MM else " (text only)"), "gemma-4-E4B_q4_0-it.gguf", ctx(16384, **VISION) + KV + GEMMA_SAMPLING + REASONING_OFF, mmproj=_GEMMA_MM),
+    preset("8. Qwen2.5-VL 7B - images (8k ctx)" + ("" if _QWENVL_MM else " (text only)"), "Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + QWENVL_GENCFG_SAMPLING, mmproj=_QWENVL_MM),
     # ggml-org/ultravox-v0_5-llama-3_1-8b-GGUF ships its weights under the same file name as plain Llama 3.1;
     # the projector is what makes it Ultravox.
-    preset("9. Ultravox audio  |  EXPERIMENTAL (Llama 3.1 + projector)" + ("" if _ULTRAVOX_MM else " (no mmproj: text-only)"), "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(4096, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "256"] + LLAMA_SAMPLING, mmproj=_ULTRAVOX_MM),
-    preset("10. Qwen3-ASR 1.7B  |  GREEDY (publisher method)" + ("" if _ASR_MM else " (no mmproj: text-only)"), "Qwen3-ASR-1.7B-Q8_0.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + ASR_SAMPLING, mmproj=_ASR_MM),
-    preset("11. SmolVLM2 500M  |  VIDEO, greedy (fps 1)" + ("" if _SMOL_MM else " (no mmproj: text-only)"), "SmolVLM2-500M-Video-Instruct-Q8_0.gguf", ctx(8192, **VISION) + KV + ["--video-fps", "1"] + SMOL_SAMPLING, mmproj=_SMOL_MM),
-    preset("12. Qwen2.5-Coder 7B Q6_K  |  Qwen generation_config", "Qwen2.5-Coder-7B-Instruct-Q6_K.gguf", ctx(8192) + KV + QWEN_CODER_SAMPLING),
-    preset("13. Qwen2.5-Coder 14B Q4_K_M  |  CODING, partial GPU (experimental)", "qwen2.5-coder-14b-instruct-q4_k_m.gguf", ctx(4096, b=128, ub=32, ngl=16) + ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--cache-ram", "2048"] + QWEN_CODER_SAMPLING),
-    preset("14. MiMo-V2.6-Distill-Qwen-9B Q4_K_M  |  AGENTIC, publisher sampler", "MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MIMO_SAMPLING + REASONING_ON),
+    preset("9. Ultravox audio - experimental (4k ctx)" + ("" if _ULTRAVOX_MM else " (text only)"), "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(4096, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "256"] + LLAMA_SAMPLING, mmproj=_ULTRAVOX_MM),
+    preset("10. Qwen3-ASR 1.7B - speech to text (8k ctx)" + ("" if _ASR_MM else " (text only)"), "Qwen3-ASR-1.7B-Q8_0.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + ASR_SAMPLING, mmproj=_ASR_MM),
+    preset("11. SmolVLM2 500M - video (8k ctx)" + ("" if _SMOL_MM else " (text only)"), "SmolVLM2-500M-Video-Instruct-Q8_0.gguf", ctx(8192, **VISION) + KV + ["--video-fps", "1"] + SMOL_SAMPLING, mmproj=_SMOL_MM),
+    preset("12. Qwen2.5-Coder 7B - coding (8k ctx)", "Qwen2.5-Coder-7B-Instruct-Q6_K.gguf", ctx(8192) + KV + QWEN_CODER_SAMPLING),
+    preset("13. Qwen2.5-Coder 14B - coding, lighter (4k ctx)", "qwen2.5-coder-14b-instruct-q4_k_m.gguf", ctx(4096, b=128, ub=32, ngl=16) + ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--cache-ram", "2048"] + QWEN_CODER_SAMPLING),
+    preset("14. MiMo-V2.6-Distill-Qwen-9B - agentic (8k ctx)", "MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MIMO_SAMPLING + REASONING_ON),
     # Decode OOM on a 512-token prompt: GPU-side memory, so fewer GPU layers. KV stays q8_0 (this hybrid model
     # keeps KV in only 8 of 32 layers, so a q4_0 switch saves a few MiB). --cache-ram is host RAM, not GPU.
-    preset("15. MiMo-V2.6-Distill-Qwen-9B Q8_0", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", ctx(2048, b=64, ub=32, ngl=4) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "1024"] + ["--jinja", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]),
-    preset("16. Qwen3.5-9B Q4_K_M  |  GENERAL, non-thinking (Qwen card)", "Qwen3.5-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + QWEN35_SAMPLING + REASONING_OFF),
-    preset("17. Nemotron 3 Nano 4B Q4_K_M  |  REASONING (NVIDIA sampler)", "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf", ctx(65536) + KV + NEMOTRON_4B_SAMPLING + REASONING_ON),
-    preset("18. DeepSeek-R1-Distill-Qwen-7B Q4_K_M  |  REASONING (DeepSeek sampler)", "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + DEEPSEEK_R1_SAMPLING + REASONING_ON),
-    preset("19. Ministral 3 8B Instruct 2512 Q4_K_M  |  DENSE, Mistral Instruct guidance", "Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MINISTRAL_SAMPLING),
-    preset("20. Nemotron-Nano-9B-v2 Q4_K_M OFFICIAL", "Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf", ctx(4096, b=128, ub=32, ngl=16) + KV + ["--jinja", "--temp", "0.6", "--top-p", "0.95"]),
+    preset("15. MiMo-V2.6-Distill-Qwen-9B Q8_0 - agentic (2k ctx)", "MiMo-V2.6-Distill-Qwen-9B-Q8_0.gguf", ctx(2048, b=64, ub=32, ngl=4) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "1024"] + ["--jinja", "--temp", "0.6", "--top-p", "0.95", "--top-k", "20"]),
+    preset("16. Qwen3.5-9B - no thinking (8k ctx)", "Qwen3.5-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + QWEN35_SAMPLING + REASONING_OFF),
+    preset("17. Nemotron 3 Nano 4B - thinking (64k ctx)", "NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf", ctx(65536) + KV + NEMOTRON_4B_SAMPLING + REASONING_ON),
+    preset("18. DeepSeek-R1-Distill-Qwen-7B - thinking (8k ctx)", "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + DEEPSEEK_R1_SAMPLING + REASONING_ON),
+    preset("19. Ministral 3 8B - general (8k ctx)", "Ministral-3-8B-Instruct-2512-BF16-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MINISTRAL_SAMPLING),
+    preset("20. Nemotron-Nano 9B - thinking (4k ctx)", "Nemotron-Nano-9B-v2-Q4_K_M-OFFICIAL.gguf", ctx(4096, b=128, ub=32, ngl=16) + KV + ["--jinja", "--temp", "0.6", "--top-p", "0.95"]),
     # OLMoE: the official max context is 4096, so this preset uses exactly that (nothing to cut).
-    preset("21. OLMoE 1B-7B Q6_K  |  MoE (64 experts, 8 active), chat sampler", "OLMoE-Q6_K.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + OLMOE_SAMPLING),
+    preset("21. OLMoE 1B-7B - general (4k ctx)", "OLMoE-Q6_K.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + OLMOE_SAMPLING),
     # Qwen1.5-MoE: official max is 32768, but that OOMs at this file size on a 7-9 GB laptop.
     # 2048 is the context that actually runs; 4096 is kept as an "if you have the RAM" variant.
-    preset("22. Qwen1.5-MoE-A2.7B-Chat Q3_K_M  |  MoE (60 experts, 4 active), Qwen sampler", "Qwen-MoE-Q3_K_M.gguf", ctx(2048, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
-    preset("22b. Qwen1.5-MoE-A2.7B-Chat Q3_K_M  |  ctx 4096 (needs ~9 GB free)", "Qwen-MoE-Q3_K_M.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
+    preset("22. Qwen1.5-MoE-A2.7B-Chat - general (2k ctx)", "Qwen-MoE-Q3_K_M.gguf", ctx(2048, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
+    preset("22b. Qwen1.5-MoE-A2.7B-Chat - general (4k ctx)", "Qwen-MoE-Q3_K_M.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
 ]
 def _preset_files(p):
     names = [p["exe"]]
@@ -648,6 +726,33 @@ def _other_launcher_copies():
                 found.append((path, other))
     return found
 
+def _is_crash_exit(code):
+    """True for a Windows crash exit code (0xC000.... = user-mode exception).
+
+    The Vulkan driver gives up by killing the process, and it can do that
+    without printing an out-of-memory line first. The launcher would then see
+    a dead server with nothing to recognise, so the crash code itself is the
+    signal that the GPU was asked for too much.
+    """
+    try:
+        c = int(code)
+    except Exception:
+        return False
+    return 0xC0000000 <= c <= 0xC000FFFF
+
+
+def _sampling_mismatch(rec, mode):
+    """True if the record was tuned with different sampling settings.
+
+    The sampler is part of the memory footprint, so a value tuned with one
+    sampler is not necessarily right for another. A record with no sampling
+    field comes from an older launcher: keep it rather than re-tune everything.
+    """
+    if not rec or "sampling" not in rec:
+        return False
+    return rec.get("sampling") != mode
+
+
 def _auto_applies(p):
     """All llama-server presets with -ngl. No model is excluded."""
     return p["exe"] == "llama-server.exe" and "-ngl" in p["args"] and "-m" in p["args"]
@@ -806,10 +911,10 @@ def _test_prompt(ctx_tokens):
     return "The quick brown fox jumps over the lazy dog. " * (target // 10 + 1) + "Reply with the single word OK."
 
 
-def _auto_try(p, port, ngl, cancel):
+def _auto_try(p, port, ngl, cancel, args=None):
     """One trial. Returns (status, detail, meta); status is 'ok', 'oom', 'other' or 'cancelled'."""
     exe = os.path.join(BASE_DIR, p["exe"])
-    args = list(p["args"])
+    args = list(args if args is not None else p["args"])
     args[args.index("-ngl") + 1] = str(ngl)
     ctx_tokens = int(args[args.index("-c") + 1]) if "-c" in args else 4096
     cmd = [exe] + args + ["--port", str(port)] + EXTRA_SERVER_ARGS
@@ -927,7 +1032,7 @@ def _auto_safe_start(p, layers, free_mib):
         return None
 
 
-def auto_tune_ngl(p, port, out, cancel):
+def auto_tune_ngl(p, port, out, cancel, args=None):
     """Worker thread (no Tk calls). Puts ('log', text), then exactly one of
     ('done', ngl, meta), ('failed', reason) or ('cancelled', None).
     Phase 1: coarse trials, full prompt. Phase 2: binary-search climb to the highest working value."""
@@ -959,7 +1064,7 @@ def auto_tune_ngl(p, port, out, cancel):
                 out.put(("cancelled", None))
                 return
             out.put(("log", f"[auto ngl] trying -ngl {ngl} ..."))
-            status, detail, meta = _auto_try(p, port, ngl, cancel)
+            status, detail, meta = _auto_try(p, port, ngl, cancel, args)
             if status == "cancelled":
                 out.put(("cancelled", None))
                 return
@@ -997,7 +1102,7 @@ def auto_tune_ngl(p, port, out, cancel):
                     return
                 mid = (lo + hi) // 2
                 out.put(("log", f"[auto ngl] climb: trying -ngl {mid} ..."))
-                status, detail, meta = _auto_try(p, port, mid, cancel)
+                status, detail, meta = _auto_try(p, port, mid, cancel, args)
                 if status == "cancelled":
                     out.put(("cancelled", None))
                     return
@@ -1045,6 +1150,8 @@ class App(tk.Tk):
         self.oom_pending = False
         # Opt-in: broad cleanup can cause other applications to page data back in.
         self.auto_clear = tk.BooleanVar(value=False)
+        self.sampling_mode = tk.StringVar(value="Normal (publisher settings)")
+        self.run_mode = None          # sampling mode the running server was started with
         self.port = tk.StringVar(value=DEFAULT_PORT)
         self.choice = tk.StringVar(value=PRESETS[0]["name"])
         self._build_ui()
@@ -1052,6 +1159,9 @@ class App(tk.Tk):
         # First line of every run: which copy is this, and where does it look.
         self._log(f"[launcher] version {APP_VERSION} | file: {os.path.abspath(__file__)} | "
                   f"BASE_DIR: {BASE_DIR} | {len(PRESETS)} presets")
+        ver = server_version()
+        if ver:
+            self._log(f"[launcher] llama.cpp: {ver}")
         others = _other_launcher_copies()
         if others:
             listed = ", ".join(f"{p} (version {v})" if v else f"{p} (older, no version marker)"
@@ -1078,7 +1188,7 @@ class App(tk.Tk):
         top.pack(fill="x", **pad)
         ttk.Label(top, text="Model preset:").pack(side="left")
         self.combo = ttk.Combobox(top, textvariable=self.choice, state="readonly",
-                                  values=[p["name"] for p in PRESETS], width=55,
+                                  values=[p["name"] for p in PRESETS], width=60,
                                   height=len(PRESETS))  # show every preset without scrolling
         self.combo.pack(side="left", padx=8, fill="x", expand=True)
         self.combo.bind("<<ComboboxSelected>>", lambda e: self._update_cmd())
@@ -1107,6 +1217,15 @@ class App(tk.Tk):
             ttk.Button(opts, text="Restart as Admin (enables full RAM flush)", command=self._relaunch_admin).pack(side="right")
         else:
             ttk.Label(opts, text="Running as admin ✔", foreground="#2e8b57").pack(side="right")
+        opts2 = ttk.Frame(self)
+        opts2.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(opts2, text="Sampling:").pack(side="left", padx=(0, 4))
+        self.sampling_box = ttk.Combobox(opts2, textvariable=self.sampling_mode, state="readonly",
+                                         values=list(SAMPLING_MODES), width=28)
+        self.sampling_box.pack(side="left")
+        self.sampling_box.bind("<<ComboboxSelected>>", lambda e: self._sampling_changed())
+        ttk.Label(opts2, text="Changes how the model writes. Presets stay publisher-official.",
+                  foreground="#666").pack(side="left", padx=(8, 0))
         stat = ttk.Frame(self)
         stat.pack(fill="x", **pad)
         self.status = tk.Label(stat, text="", fg="white", font=("Segoe UI", 10, "bold"), padx=12, pady=3)
@@ -1656,7 +1775,9 @@ class App(tk.Tk):
         self._set_status("Auto-tuning NGL…", "#d98c00")
         self._log(f"\n=== Auto-tuning NGL for {p['name']} (port {port}): {reason} ===")
         self._log("[auto ngl] each trial loads the model; big models take several minutes")
-        threading.Thread(target=auto_tune_ngl, args=(p, port, self.auto_q, self.auto_cancel), daemon=True).start()
+        threading.Thread(target=auto_tune_ngl,
+                         args=(p, port, self.auto_q, self.auto_cancel, self._sampler_args(p)),
+                         daemon=True).start()
         self.after(200, self._poll_auto)
 
     def _poll_auto(self):
@@ -1715,6 +1836,7 @@ class App(tk.Tk):
                     and AUTO_CACHE[k].get("mmproj") == mm_value and k != key and k not in live_keys:
                 del AUTO_CACHE[k]
         rec = {"model": model_name, "ngl": ngl, "ctx": ctx_value, "mmproj": mm_value,
+               "sampling": self.sampling_mode.get(),
                "tested_at": time.strftime("%Y-%m-%d %H:%M"), **(meta or {})}
         if "cache_ram" not in rec:
             rec["cache_ram"] = cache_value
@@ -1762,9 +1884,41 @@ class App(tk.Tk):
     def _selected(self):
         return next(p for p in PRESETS if p["name"] == self.choice.get())
 
+    def _sampler_args(self, p):
+        """The preset's args with the chosen sampling mode applied."""
+        return apply_sampling_mode(p["args"], self.sampling_mode.get())
+
+    def _sampler_pending(self):
+        """True when the running server was started with different sampling settings."""
+        try:
+            if not (self.proc and self.proc.poll() is None):
+                return False
+        except Exception:
+            return False
+        run_flags = SAMPLING_MODES.get(getattr(self, "run_mode", None))
+        cur_flags = SAMPLING_MODES.get(self.sampling_mode.get())
+        return run_flags != cur_flags
+
+    def _sampling_changed(self):
+        """The user changed the sampling mode.
+
+        The running server keeps the settings it was started with, so ask
+        before restarting it: a restart cancels an answer in progress.
+        """
+        pending = self._sampler_pending()
+        if pending and not self.tuning:
+            if messagebox.askyesno(
+                    "Restart to apply the new settings?",
+                    "The running server was started with the old settings.\n\n"
+                    "Restart it now? Any answer in progress will be cancelled."):
+                self.start()          # restart with the new settings
+            else:
+                self._log("[sampling] changed. Press RESTART when you are ready to apply it.")
+        self._update_cmd()
+
     def _build_cmd(self):
         p = self._selected()
-        cmd = [p["exe"]] + p["args"]
+        cmd = [p["exe"]] + self._sampler_args(p)
         if p["exe"] == "llama-server.exe":
             cmd += ["--port", self.port.get().strip() or DEFAULT_PORT]
             cmd += EXTRA_SERVER_ARGS
@@ -1783,6 +1937,8 @@ class App(tk.Tk):
                 text += f"\n[{rec['note']}]"
         elif _auto_applies(p) and _auto_key(p):
             text += "\n[auto ngl: no saved value yet; START will tune it first]"
+        if self._sampler_pending():
+            text += "\n[sampling changed - the running server still uses the old settings, press RESTART]"
         self.cmd_label.config(text=text)
         self._refresh_mem()         # Memory tab: loads the file size + GGUF header for the selected model
 
@@ -1813,12 +1969,17 @@ class App(tk.Tk):
             return
         p = self._selected()
         rec = _auto_record(p)
-        if _auto_applies(p) and _auto_key(p) is not None and (rec is None or _auto_is_stale(p, rec)):
-            if rec is not None:
+        mismatch = _sampling_mismatch(rec, self.sampling_mode.get())
+        if _auto_applies(p) and _auto_key(p) is not None and (rec is None or _auto_is_stale(p, rec) or mismatch):
+            if rec is None:
+                self._begin_tuning(p)               # first run for this model/ctx/KV: tune, then start
+            elif mismatch:
+                self._log(f"[auto ngl] saved -ngl {rec['ngl']} was tuned with different sampling "
+                          f"settings, retuning for the new ones")
+                self._begin_tuning(p, reason=f"saved -ngl {rec['ngl']} was tuned with other sampling, retuning")
+            else:
                 self._log(f"[auto ngl] saved -ngl {rec['ngl']} is stale: free RAM dropped since tuning, retuning")
                 self._begin_tuning(p, reason=f"saved -ngl {rec['ngl']} is stale, retuning")
-            else:
-                self._begin_tuning(p)               # first run for this model/ctx/KV: tune, then start
             return
         cmd = self._build_cmd()
         port_value = self.port.get().strip() or DEFAULT_PORT
@@ -1842,9 +2003,11 @@ class App(tk.Tk):
         if not os.path.isfile(os.path.join(BASE_DIR, os.path.basename(model))):
             messagebox.showerror("Model not found", f"{os.path.join(BASE_DIR, model)} does not exist.")
             return
-        self._ram_warning(p)
         self._stop_process()
         self._wait_ram()
+        # After the old server is gone and its memory has come back, so the
+        # reading is what the new server actually gets.
+        self._ram_warning(p)
         self.gen += 1
         gen = self.gen
         auto = _auto_applies(p) and _auto_key(p) is not None
@@ -1863,6 +2026,9 @@ class App(tk.Tk):
             self._set_status("Stopped", "#888888")
             self._set_run_state("stopped")
             return
+        # Remember what the running server was started with, so a later change
+        # to the sampling can be reported as "not applied yet".
+        self.run_mode = self.sampling_mode.get()
         self._set_status("Starting…", "#d98c00")
         self._set_run_state("starting")
         threading.Thread(target=self._reader, args=(self.proc, gen), daemon=True).start()
@@ -2064,6 +2230,14 @@ class App(tk.Tk):
                     if "processing task" in low:
                         self.mem_busy = True
                 elif kind == "exit":
+                    if (self.run_auto and not self.tuning and _is_crash_exit(data)):
+                        # The server was killed by the graphics driver and printed no
+                        # out-of-memory line, so the OOM detector could not see it.
+                        # The crash code is the tell: treat it as too many GPU layers.
+                        self._log(f"[auto ngl] the server crashed (exit code {data}) without an "
+                                  f"out-of-memory message. Treating it as too many GPU layers.")
+                        self._on_oom(gen)
+                        return
                     self._log(f"=== process exited (code {data}) ===")
                     self._set_status("Stopped", "#888888")
                     self._set_run_state("stopped")
