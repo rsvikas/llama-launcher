@@ -31,7 +31,7 @@ DEFAULT_PORT = "8080"
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-24.18"
+APP_VERSION = "2026-11-24.19"
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -51,6 +51,13 @@ def ctx(n=16384, b=512, ub=512, ngl=99):
     return ["-c", str(n), "-np", "1", "-ngl", str(ngl), "-b", str(b), "-ub", str(ub)]
 
 KV = ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "2048"]
+
+# The 27B is the one model here that does not fit in a 16 GB laptop with room to
+# spare: weights + chat memory are about 7.5 GB before a single layer is offloaded.
+# Its prompt cache is capped at 512 MiB instead of the global 2048 MiB, so that
+# 1.5 GB stays available for the weights and for the graphics chip.  The cap only
+# costs anything when a new question repeats a long old one; see the README.
+KV_27B = ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"]
 
 # --- PrismML "Ternary Bonsai 2" samplers ---------------------------------
 # https://docs.prismml.com/models/bonsai-2-27b -> "Best practices / Generation parameters"
@@ -318,9 +325,9 @@ STARTUP_NOTICES = []
 # Qwen1.5-MoE  https://huggingface.co/Qwen/Qwen1.5-MoE-A2.7B-Chat        (generation_config.json: 0.7/0.8/20/1.05)
 # llama.cpp CLI  https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md
 PRESETS = [
-    preset("1. Bonsai 2 27B - thinking (8k ctx)", BONSAI_27B_FILE, ctx(8192) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
-    preset("1b. Bonsai 2 27B - thinking (4k ctx, lighter)", BONSAI_27B_FILE, ctx(4096, b=128, ub=64) + KV + SAMPLING_27B + REASONING_ON + think(-1)),
-    preset("1c. Bonsai 2 27B - no thinking (8k ctx)", BONSAI_27B_FILE, ctx(8192) + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
+    preset("1. Bonsai 2 27B - thinking (8k ctx)", BONSAI_27B_FILE, ctx(8192) + KV_27B + SAMPLING_27B + REASONING_ON + think(-1)),
+    preset("1b. Bonsai 2 27B - thinking (4k ctx, lighter)", BONSAI_27B_FILE, ctx(4096, b=128, ub=64) + KV_27B + SAMPLING_27B + REASONING_ON + think(-1)),
+    preset("1c. Bonsai 2 27B - no thinking (8k ctx)", BONSAI_27B_FILE, ctx(8192) + KV_27B + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
     preset("2. Bonsai 2 9B - thinking (16k ctx)", BONSAI_9B_FILE, ctx() + KV + SAMPLING_9B + REASONING_ON + think(-1)),
     preset("2b. Bonsai 2 9B - no thinking (16k ctx)", BONSAI_9B_FILE, ctx() + KV + BONSAI_INSTRUCT_SAMPLING + REASONING_OFF),
     preset("3. Bonsai 2 9B - images + thinking, chat only" + ("" if _BONSAI9_MM else " (text only)"), BONSAI_9B_FILE, ctx(**VISION) + KV + SAMPLING_9B + REASONING_ON + think(-1), mmproj=_BONSAI9_MM),
