@@ -241,107 +241,15 @@ What does not work: asking the model to check its own answer. On a model this si
 
 **Where to put the rules.** The llama.cpp web UI has a **System Message** box in its settings. Anything you put there is sent with every request, so the model follows it in every chat, and it survives the web UI's own conversation compaction. That is the right place for "don't guess, quote your source, say I don't know". The launcher cannot set it for you: that depends on your llama.cpp version, and a client that sends its own system message would override it anyway.
 
-### One more point for code: the CODE section
+### Code: Qwen Coder needs forcing
 
-`coding-system-message.txt` in this repo holds exactly one block and nothing else. Paste it as the **first message of the chat** in the llama.cpp web UI - the UI sends it with the conversation, so it applies to every question that follows.
+Tested here, Qwen2.5-Coder 7B and 14B often refuse or invent APIs. Out of the box they are not good at coding.
 
-```
-CODE
-When you write or explain code, the code must be real. These rules are about what you write, not about whether to answer.
-Answer what was asked, in full. An open-ended request has a reasonable default answer: pick the most standard approach and state the assumption in one line.
-When you are not certain about a detail, do not stop: write the code, mark the uncertain parts, and say what you assumed.
-This machine runs Windows and Python 3. Prefer a solution that installs with pip alone and needs nothing else. List what each library needs besides pip - a separate program, a system library, a compiler - and say "none" when there is nothing.
-Naming a real, widely used API is not inventing one. Inventing is making up a function, class, method, option or path that does not exist.
-When you are shown code - a file, a snippet, a documentation excerpt - use exactly the names, APIs, options and versions it contains. When something is not in front of you, write the most reasonable version and state the assumption.
-Write complete, runnable code: no "...", no "rest of the code is similar", no placeholder comments where real work belongs. Show the whole function or block that goes into the file, and say which file it belongs in.
-When you explain code, describe what that code actually does, not what it probably does.
-Never say code was tested, run or verified unless you actually ran it in this conversation. Say "not run".
-```
+The fix is at chat / system level, not in the launcher. The launcher cannot set a system message for you.
 
-The launcher has nothing to do with this: it cannot set a system message for you, because that depends on your llama.cpp version and a client that sends its own system message would override it anyway. The web UI sends it, so the web UI is where it belongs.
-
-If you would rather have it as a real system turn than as the first user message, the llama.cpp web UI has a **System Message** box in Settings, and the same text goes there.
-
-Five things about the wording, all of them learned the hard way:
-
-- Every line is a **behaviour**, not a mood. "Be honest" is easy to agree with and then ignore; "never invent a function name you have not seen" is followable.
-- **They must not be able to read as "refuse".** The first version said "if the code you need is not in front of you, ask for it" and "if you cannot write correct code, say what you can do instead". On the 14B that turned into: *"I don't have enough information to answer accurately - please tell me which library you are using and what transformations you want."* The rules now say plainly that they are about what the model writes, not about whether it answers.
-- **They have to override the base prompt, not just add to it.** The next version still refused, and this time the opening words - *"I don't have enough information to answer accurately"* - were quoted straight out of the base prompt's own `WHEN INFORMATION IS MISSING` section. That section says to ask one clear question when something is missing and not to make hidden assumptions; for "write a script that converts X to Y", choosing the library *is* the job. So the rules now say three things that the base prompt does not: for a code task a missing detail is an assumption to state, not a reason to ask; if a detail would change the code, write the most likely case and put the question at the end; and when you are writing new code and no API was given, use the standard or the well-known library and name it.
-- The last line is there on purpose. A strict "never write code unless you are certain" gives empty answers on a small model, because it is not certain about most things. Marking the one uncertain part keeps the answer useful and still stops the invention.
-
-- **The wording is not the lever - the base prompt is.** Five runs of the same question on the same model. Run 3 answered (608 tokens) with rules full of the words "ask", "missing" and "library"; run 5 refused with almost none of them. So the wording is not what decides it, and the outcome at temperature 0.3 is close to a coin flip. What is constant in every refusal is the base prompt: the model's reply opens with *"I don't know how to directly convert..."* or *"I don't have enough information to answer accurately"*, which are the templates from `WHEN INFORMATION IS MISSING` ("Say plainly 'I don't know'") and from `WHEN IN DOUBT` ("choose uncertainty"). For a task that is one long unseen script, every answer is uncertain, so "choose uncertainty" means "do not write". The rules below say what to do and never what to ask for, but the real correction belongs in the base prompt.
-- **Tell it what machine it is writing for.** Without that, the model reached for `pdf2image`, which needs Poppler - a second program that never got mentioned, so the script would have failed on the first run. The rules now say: this machine runs Windows and Python 3, prefer a solution that installs with pip alone and needs nothing else, and if something extra is unavoidable, say so and give the exact install step.
-
-### If it still refuses: the whole prompt, ready to paste
-
-Take your base prompt **unchanged** (all 15 lines), add the `CODE` section below it,
-and **one added sentence in each of two sections**:
-
-`WHEN INFORMATION IS MISSING`:
-
-> Missing information is not a reason to refuse. If the question has a reasonable
-> default answer, give it and say what you assumed. Ask only when the answer would
-> change in a way that matters.
-
-`WHEN IN DOUBT`:
-
-> For code, uncertainty about a detail is not a reason to stop: write the code, mark
-> the uncertain parts, and say what you assumed.
-
-Both refusals came from those two sections: the model opened with *"I don't know how
-to directly convert..."* (the "Say plainly 'I don't know'" template) and *"I don't have
-enough information to answer accurately"* (the other template). One sentence in the
-right place beats three overrides in the wrong one.
-
-### How to ask for code
-
-Put the constraint **in the question**, not only in the system message. The system
-message sits thousands of tokens away from the question, and a constraint next to the
-question carries far more weight. Three words in the question can do what a paragraph
-of rules cannot:
-
-```
-write a python script to convert scanned pdf to md file.
-Constraints: Windows 11, Python 3.11, pip-only libraries - nothing else to install.
-Give me the full script plus the pip install line.
-```
-
-This is also the only way to get past a **knowledge gap**. A rule that says "prefer a
-library that installs with pip alone" cannot fire on `pdf2image`, because the model
-does not recall that `pdf2image` drives Poppler's `pdftoppm`. It picks the most
-familiar library and the rule passes over it. The rules now ask the model to *list*
-what each library needs besides pip, which forces the check it was not doing.
-
-### Or use a separate, short prompt for code
-
-`code-only-prompt.txt` is 128 words with none of the careful-factual baggage: no
-"I don't know", no "choose uncertainty", no evidence rules. It is the antidote to the
-refusal bias, and it is short enough to read in one go.
-
-```
-You write code. Answer the request with complete, runnable code, not a description of code.
-
-State your assumptions in one line at the top, then write the code.
-
-Use the real names of the libraries and APIs you rely on, and say which ones have to be installed first. This machine runs Windows and Python 3; prefer a solution that installs with pip alone.
-
-Show the whole function or block that goes into the file, and say which file it belongs in. No "...", no "rest of the code is similar", no placeholder comments where real work belongs.
-
-Never say the code was tested or run unless you actually ran it.
-
-If one detail is uncertain, write the rest and mark that detail: "not sure - needs <what>".
-```
-
-The long careful-factual prompt is the right prompt for *questions*. For *code*, it is the wrong one: it tells the model to prefer admitting uncertainty, and a script is uncertain by nature. Two prompts, two jobs - paste the short one when you switch to a code preset.
-
-**Test it twice with the same prompt.** The refusals are not perfectly repeatable -
-one run of the same rules wrote a 608-token answer, the next refused. That means
-sampling is part of it, and you can find out which factor decides by switching the
-Sampling dropdown to **Deterministic (same answer)** (temperature 0): if the same
-question gives the same result every time, the prompt is the whole story; if it
-still flips, the temperature is.
-
-**What these rules cannot do.** They stop the model from inventing an API or a file path, and they stop it from refusing. They do not make it think harder. If the answer is a plain, correct, boring recipe - a well-known one from the training data - the rules will not make it a better recipe. For that, the two launcher-side levers matter: the **context size** of the code presets (a script that runs out of room gets cut off) and the **Code (precise, no repeats)** sampling mode.
+- Paste `system-prompt-code.txt` in the System Message box in the llama.cpp web UI. It is the full careful prompt + CODE section + 2 fixes for refusing.
+- Or paste `code-only-prompt.txt` for code work only. Short, no "I don't know" bias.
+- Set Sampling to `Code (precise, no repeats)` for code presets.
 
 ## Can I reuse this as is?
 
