@@ -31,7 +31,7 @@ DEFAULT_PORT = "8080"
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-24.19"
+APP_VERSION = "2026-11-24.22"
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -109,12 +109,27 @@ MIROSTAT_SAMPLING = ["--mirostat", "2", "--mirostat-lr", "0.1", "--mirostat-ent"
                     "--repeat-penalty", "1.05"]
 DRY_SAMPLING = ["--dry-multiplier", "0.8", "--dry-base", "1.75", "--dry-allowed-length", "2",
                 "--dry-penalty-last-n", "128"]
+# For code, "Precise" is half right: the low temperature helps, but it also lowers the
+# repetition penalty to 1.05, while the code publishers ask for 1.1.  A lower penalty on
+# code means the model repeats the same line instead of moving on.  So this mode keeps
+# the publisher's 1.1 and adds the DRY sampler, which punishes the repeated phrase
+# directly.  Use it with the code presets.
+#
+# dry-allowed-length is 3 here, not the 2 used for prose.  DRY punishes any repeat of
+# an n-gram of that length or longer, and in code a two-word fragment repeats by
+# nature ("self.", "return ", the name of a variable).  Penalising those pushes the
+# model out of writing normal code.  Length 3 catches a repeated phrase instead.
+CODE_SAMPLING = ["--temp", "0.3", "--top-k", "20", "--top-p", "0.8", "--min-p", "0.05",
+                 "--repeat-penalty", "1.1",
+                 "--dry-multiplier", "0.8", "--dry-base", "1.75",
+                 "--dry-allowed-length", "3", "--dry-penalty-last-n", "128"]
 SAMPLING_MODES = {
     "Normal (publisher settings)": None,
     "Precise (less random)": PRECISE_SAMPLING,
     "Deterministic (same answer)": DETERMINISTIC_SAMPLING,
     "Mirostat 2 (steady)": MIROSTAT_SAMPLING,
     "Precise + DRY (no repeats)": PRECISE_SAMPLING + DRY_SAMPLING,
+    "Code (precise, no repeats)": CODE_SAMPLING,
 }
 
 def apply_sampling_mode(args, mode):
@@ -179,13 +194,14 @@ def resolve_file(name):
             return e
     return name
 
-def preset(name, model, extra, exe="llama-server.exe", mmproj=None):
+def preset(name, model, extra, exe="llama-server.exe", mmproj=None, coding=False):
     model = resolve_file(model)
     args = ["-m", os.path.join(".", model)]
     if mmproj:
         mmproj = resolve_file(mmproj)
         args += ["--mmproj", os.path.join(".", mmproj)]
-    return {"name": name, "exe": exe, "args": args + extra}
+    # "coding" marks the presets where the coding rules and the code sampler matter.
+    return {"name": name, "exe": exe, "args": args + extra, "coding": coding}
 
 # Projector preference: Q8_0 first (smallest), then f16, then bf16 (reference
 # precision), matching what each publisher recommends.
@@ -343,8 +359,12 @@ PRESETS = [
     preset("9. Ultravox audio - experimental (4k ctx)" + ("" if _ULTRAVOX_MM else " (text only)"), "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(4096, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "256"] + LLAMA_SAMPLING, mmproj=_ULTRAVOX_MM),
     preset("10. Qwen3-ASR 1.7B - speech to text (8k ctx)" + ("" if _ASR_MM else " (text only)"), "Qwen3-ASR-1.7B-Q8_0.gguf", ctx(8192, **VISION) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "512"] + ASR_SAMPLING, mmproj=_ASR_MM),
     preset("11. SmolVLM2 500M - video (8k ctx)" + ("" if _SMOL_MM else " (text only)"), "SmolVLM2-500M-Video-Instruct-Q8_0.gguf", ctx(8192, **VISION) + KV + ["--video-fps", "1"] + SMOL_SAMPLING, mmproj=_SMOL_MM),
-    preset("12. Qwen2.5-Coder 7B - coding (8k ctx)", "Qwen2.5-Coder-7B-Instruct-Q6_K.gguf", ctx(8192) + KV + QWEN_CODER_SAMPLING),
-    preset("13. Qwen2.5-Coder 14B - coding, lighter (4k ctx)", "qwen2.5-coder-14b-instruct-q4_k_m.gguf", ctx(4096, b=128, ub=32, ngl=16) + ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--cache-ram", "2048"] + QWEN_CODER_SAMPLING),
+    # The code presets get more room than the others: a script of 200 lines is about
+    # 2500 tokens, and it also has to fit the question, the file being worked on and
+    # the answer. At 4096 the 14B ran out of context in the middle of a script.
+    preset("12. Qwen2.5-Coder 7B - coding (16k ctx)", "Qwen2.5-Coder-7B-Instruct-Q6_K.gguf", ctx(16384) + KV + QWEN_CODER_SAMPLING, coding=True),
+    preset("13. Qwen2.5-Coder 14B - coding (8k ctx)", "qwen2.5-coder-14b-instruct-q4_k_m.gguf", ctx(8192, b=128, ub=32, ngl=16) + ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--cache-ram", "2048"] + QWEN_CODER_SAMPLING, coding=True),
+    preset("13b. Qwen2.5-Coder 14B - coding, lighter (4k ctx)", "qwen2.5-coder-14b-instruct-q4_k_m.gguf", ctx(4096, b=128, ub=32, ngl=16) + ["-fa", "on", "-ctk", "q4_0", "-ctv", "q4_0", "--cache-ram", "2048"] + QWEN_CODER_SAMPLING, coding=True),
     preset("14. MiMo-V2.6-Distill-Qwen-9B - agentic (8k ctx)", "MiMo-V2.6-Distill-Qwen-9B-Q4_K_M-OFFICIAL.gguf", ctx(8192) + KV + MIMO_SAMPLING + REASONING_ON),
     # Decode OOM on a 512-token prompt: GPU-side memory, so fewer GPU layers. KV stays q8_0 (this hybrid model
     # keeps KV in only 8 of 32 layers, so a q4_0 switch saves a few MiB). --cache-ram is host RAM, not GPU.
@@ -1397,6 +1417,21 @@ class App(tk.Tk):
         self.copy_btn.config(text="Copied ✓")
         self.after(1500, lambda: self.copy_btn.config(text="Copy log"))
 
+    def _coding_hint(self, p):
+        """Say what the launcher can do for code output, once per preset change.
+
+        The coding rules themselves are not the launcher's business: the llama.cpp
+        web UI sends them with the chat.  The sampler is.
+        """
+        if getattr(self, "_hint_preset", None) == p["name"]:
+            return
+        self._hint_preset = p["name"]
+        if not p.get("coding"):
+            return
+        self._log("[coding] code preset selected. For code, switch the Sampling dropdown to "
+                  "'Code (precise, no repeats)': low temperature, the publisher's repetition "
+                  "penalty, and the DRY sampler that stops the model repeating the same line.")
+
     def _reset_mem(self):
         self.mem = {k: {} for k in ("model", "kv", "rs", "compute", "output")}
         self.mem_cache = None
@@ -2105,6 +2140,7 @@ class App(tk.Tk):
         if self._sampler_pending():
             text += "\n[sampling changed - the running server still uses the old settings, press RESTART]"
         self.cmd_label.config(text=text)
+        self._coding_hint(p)
         self._refresh_mem()         # Memory tab: loads the file size + GGUF header for the selected model
 
     def _set_status(self, text, color):
