@@ -349,6 +349,8 @@ PRESETS = [
     preset("3. Bonsai 2 9B - images + thinking, chat only" + ("" if _BONSAI9_MM else " (text only)"), BONSAI_9B_FILE, ctx(**VISION) + KV + SAMPLING_9B + REASONING_ON + think(-1), mmproj=_BONSAI9_MM),
     preset("4. Gemma 4 E4B - no thinking (24k ctx)", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_OFF),
     preset("4b. Gemma 4 E4B - thinking (24k ctx)", "gemma-4-E4B_q4_0-it.gguf", ctx(24576) + KV + GEMMA_SAMPLING + REASONING_ON),
+    preset("4c. Gemma 4 12B - no thinking (16k ctx)", "gemma-4-12b-it-qat-q4_0.gguf", ctx(16384) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "1024"] + GEMMA_SAMPLING + REASONING_OFF),
+    preset("4d. Gemma 4 12B - thinking (8k ctx)", "gemma-4-12b-it-qat-q4_0.gguf", ctx(8192) + ["-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--cache-ram", "1024"] + GEMMA_SAMPLING + REASONING_ON),
     preset("5. Qwen3 8B - thinking (16k ctx)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_SAMPLING + REASONING_ON + think(-1)),
     preset("5b. Qwen3 8B - no thinking (16k ctx)", "Qwen3-8B-Q4_K_M.gguf", ctx(16384) + KV + QWEN_NON_THINKING_SAMPLING + REASONING_OFF),
     preset("6. Llama 3.1 8B - general (8k ctx)", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", ctx(8192) + KV + LLAMA_SAMPLING),
@@ -380,6 +382,7 @@ PRESETS = [
     # 2048 is the context that actually runs; 4096 is kept as an "if you have the RAM" variant.
     preset("22. Qwen1.5-MoE-A2.7B-Chat - general (2k ctx)", "Qwen-MoE-Q3_K_M.gguf", ctx(2048, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
     preset("22b. Qwen1.5-MoE-A2.7B-Chat - general (4k ctx)", "Qwen-MoE-Q3_K_M.gguf", ctx(4096, b=512, ub=512, ngl=99) + KV + QWEN15MOE_SAMPLING),
+    
 ]
 def _preset_files(p):
     names = [p["exe"]]

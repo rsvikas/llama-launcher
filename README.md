@@ -102,6 +102,8 @@ These presets are already in `llama_launcher.pyw`. You download the GGUF files y
 | 3. Bonsai 2 9B - images + thinking, chat only | Ternary-Bonsai-2-9B-Q2_0.gguf + Ternary-Bonsai-2-9B-mmproj-Q8_0.gguf | Images, thinking. Chat apps only, not agent tools |
 | 4. Gemma 4 E4B - no thinking (24k ctx) | gemma-4-E4B_q4_0-it.gguf | General chat |
 | 4b. Gemma 4 E4B - thinking (24k ctx) | gemma-4-E4B_q4_0-it.gguf | General chat with thinking |
+| 4c. Gemma 4 12B No Thinking (16k ctx) | gemma-4-12b-it-qat-q4_0.gguf | General chat |
+| 4d. Gemma 4 12B Thinking (8k ctx) | gemma-4-12b-it-qat-q4_0.gguf | General chat, thinking |
 | 5. Qwen3 8B - thinking (16k ctx) | Qwen3-8B-Q4_K_M.gguf | General chat |
 | 5b. Qwen3 8B - no thinking (16k ctx) | Qwen3-8B-Q4_K_M.gguf | General chat, faster |
 | 6. Llama 3.1 8B - general (8k ctx) | Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf | General chat |
