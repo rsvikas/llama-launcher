@@ -50,7 +50,7 @@ WIN_W, WIN_H = 1000, 840          # the launcher window size
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-26.07"
+APP_VERSION = "2026-11-26.08"
 
 # The combobox starts on this entry instead of on a preset: nothing is chosen
 # until the user picks one, so START never starts a model by accident.
@@ -1677,6 +1677,79 @@ class MatTab(tk.Canvas):
             self._cmd()
 
 
+class ScrollArea(tk.Frame):
+    """A scrolling area for content that can be taller than the window.
+
+    A bare Tk canvas scrolls into empty space as soon as its scroll region is
+    missing or smaller than the window, because there is then nothing that
+    confines the view.  So the region is built from the real content height,
+    is never smaller than the window, and is refreshed whenever the content
+    or the window changes.  The scrollbar only shows when there is something
+    to scroll.
+    """
+
+    def __init__(self, parent, bg=MD_CARD):
+        super().__init__(parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
+                                  style="Vertical.TScrollbar")
+        self.canvas.configure(yscrollcommand=self._scroll_set)
+        self._bar_on = True
+        self.vbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._win = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", lambda e: self.sync())
+        self.canvas.bind("<Configure>", self._resized)
+
+    # ---- geometry ------------------------------------------------------
+    def sync(self):
+        """Make the scroll region match the content, and never be smaller
+        than the window - that is what stops the scrolling into blank space."""
+        try:
+            w = self.canvas.winfo_width()
+            h = self.canvas.winfo_height()
+            if w <= 1 or h <= 1:
+                return                       # not laid out yet: try again later
+            ih = self.inner.winfo_height()
+            if ih <= 1:
+                ih = self.inner.winfo_reqheight()
+            self.canvas.configure(scrollregion=(0, 0, w, max(h, ih)))
+        except Exception:
+            pass
+
+    def _resized(self, event):
+        try:
+            self.canvas.itemconfig(self._win, width=event.width)
+        except Exception:
+            pass
+        self.sync()
+
+    def _scroll_set(self, first, last):
+        # the scrollbar only appears when the content does not fit
+        needed = float(last) - float(first) < 0.999
+        if needed != self._bar_on:
+            self._bar_on = needed
+            if needed:
+                self.vbar.pack(side="right", fill="y")
+            else:
+                self.vbar.pack_forget()
+        self.vbar.set(first, last)
+
+    # ---- input ---------------------------------------------------------
+    def scroll(self, units):
+        self.canvas.yview_scroll(units, "units")
+
+    def pointer_inside(self, event):
+        """True when the mouse is over the scrollable area."""
+        w = self.canvas.winfo_containing(event.x_root, event.y_root)
+        while w is not None:
+            if w is self.canvas:
+                return True
+            w = w.master
+        return False
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2118,6 +2191,11 @@ class App(tk.Tk):
                 page.pack_forget()
         for k, tab in self._tabs.items():
             tab.set_active(k == key)
+        area = getattr(self, "mem_area", None)
+        if area is not None:
+            # the tab was hidden, so the canvas had no size: set the scroll
+            # region again now that it is on screen.
+            self.after(50, area.sync)
 
     def _clear_log(self):
         self.log.delete("1.0", "end")
@@ -2201,25 +2279,14 @@ class App(tk.Tk):
             self._bar_font = None
         wrap = tk.Frame(parent, bg=MD_CARD)
         wrap.pack(fill="both", expand=True, padx=16, pady=(4, 16))
-        canvas = tk.Canvas(wrap, highlightthickness=0, bg=MD_CARD)
-        vbar = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
-                             style="Vertical.TScrollbar")
-        canvas.configure(yscrollcommand=vbar.set)
-        vbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        inner = tk.Frame(canvas, bg=MD_CARD)
-        win = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        self.mem_area = ScrollArea(wrap, bg=MD_CARD)
+        self.mem_area.pack(fill="both", expand=True)
+        inner = self.mem_area.inner
 
         def _mem_wheel(event):
             # Mouse wheel scrolls this tab only when the pointer is over it (labels included).
-            w = canvas.winfo_containing(event.x_root, event.y_root)
-            while w is not None:
-                if w is canvas:
-                    canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
-                    return
-                w = w.master
+            if self.mem_area.pointer_inside(event):
+                self.mem_area.scroll(-1 if event.delta > 0 else 1)
         self._mem_wheel = _mem_wheel
         self.bind_all("<MouseWheel>", _mem_wheel, add="+")
 
