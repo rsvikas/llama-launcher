@@ -1,7 +1,22 @@
 """
 Llama Launcher - start / stop / switch llama.cpp models with one click.
 Double-click to run (Python 3 + tkinter). Edit PRESETS to add or change models.
-"Clear RAM" file-cache flush needs admin (use the "Restart as Admin" button once).
+
+The window is drawn in a Material Design look (flat cards, rounded buttons, one
+accent colour).  No extra package is needed for that - it is all tkinter.
+
+At startup the launcher asks whether to start normally or as administrator.
+Only an administrator can flush the Windows file cache, so that one control is
+shown in administrator mode and marked as unavailable otherwise.  Everything
+else works the same in both modes, and the badge in the header always says
+which mode the launcher is in.
+
+The three action buttons only do what makes sense right now:
+  START   - needs a preset and a stopped launcher
+  STOP    - only alive while a model runs, while auto-NGL is tuning, or while
+            a model is being started
+  RESTART - only alive while a model runs; it restarts it with the settings
+            that are on screen now (this is what applies a changed Sampling)
 
 Every sampler below was cross-checked against the publisher's own documentation
 (the SOURCES table right above PRESETS lists the links).  Where a publisher
@@ -14,6 +29,7 @@ import json
 import urllib.error
 import urllib.request
 import ctypes
+import math
 import os
 import queue
 import re
@@ -22,16 +38,38 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 from ctypes import wintypes
 from tkinter import ttk, messagebox
 
 BASE_DIR = r"C:\prism-llama"
 DEFAULT_PORT = "8080"
+WIN_W, WIN_H = 1000, 840          # the launcher window size
 NO_WINDOW = 0x08000000
 # Bump this whenever the launcher changes, so the window title and the first log
 # line always say which copy is running and where it looks for the models.
-APP_VERSION = "2026-11-24.22"
+APP_VERSION = "2026-11-26.07"
+
+# The combobox starts on this entry instead of on a preset: nothing is chosen
+# until the user picks one, so START never starts a model by accident.
+NO_PRESET = "— Select a preset to start —"
+
+# A .pyw has no console, so an error that is not shown on screen is an error
+# the user never sees.  Every failure is written here as well.
+ERROR_LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "launcher_error.log")
+
+
+def write_error_log(detail):
+    """Write a traceback to the error log next to the launcher."""
+    try:
+        with open(ERROR_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n{detail}\n")
+    except Exception:
+        pass
+    return ERROR_LOG_FILE
 
 # llama-server verbosity: 3 = info (default), 4 = trace, 5 = debug.
 # Level 4 adds the server's "cache state: N prompts, X MiB" line, which is what
@@ -1289,20 +1327,374 @@ def _lighter_preset_for(p):
     return best
 
 
+# ---------------------------------------------------------------------------
+# Material Design look
+#
+# tkinter ships no Material theme, so the parts that carry the design - the
+# action buttons, the status chip, the cards - are drawn by hand on a canvas,
+# and the remaining widgets use the "clam" theme with Material colours.
+# Nothing here needs an extra package: it is all tkinter.
+# ---------------------------------------------------------------------------
+MD_BG = "#F4F5F7"          # window background
+MD_CARD = "#FFFFFF"        # card surface
+MD_SURFACE = "#FAFAFB"     # inset surface (command preview)
+MD_OUTLINE = "#E1E3E8"     # 1 px card border
+MD_TEXT = "#1F2328"
+MD_TEXT2 = "#6A707A"
+MD_PRIMARY = "#3F51B5"     # indigo
+MD_PRIMARY_D = "#303F9F"
+MD_PRIMARY_T = "#EEF0FB"   # indigo tint, used for hover on flat buttons
+MD_TEAL = "#00897B"
+MD_TEAL_D = "#00695C"
+MD_TEAL_T = "#E4F2F0"
+MD_ERROR = "#D32F2F"
+MD_ERROR_D = "#B71C1C"
+MD_ERROR_T = "#FDECEA"
+MD_WARN = "#ED6C02"
+MD_OK = "#2E7D32"
+MD_OFF_BG = "#E4E6EA"      # disabled button fill
+MD_OFF_FG = "#A5AAB2"      # disabled button text
+MD_FONT = ("Segoe UI", 10)
+MD_FONT_B = ("Segoe UI", 10, "bold")
+MD_FONT_S = ("Segoe UI", 9)
+MD_FONT_SB = ("Segoe UI", 9, "bold")
+MD_FONT_MONO = ("Consolas", 9)
+
+
+def _round_rect(x0, y0, x1, y1, r, steps=8):
+    """Points of a rounded rectangle, ready for create_polygon."""
+    r = max(0.0, min(r, (x1 - x0) / 2.0, (y1 - y0) / 2.0))
+    pts = []
+    corners = ((x1 - r, y0 + r, 270, 360),
+               (x1 - r, y1 - r, 0, 90),
+               (x0 + r, y1 - r, 90, 180),
+               (x0 + r, y0 + r, 180, 270))
+    for cx, cy, a0, a1 in corners:
+        for i in range(steps + 1):
+            a = math.radians(a0 + (a1 - a0) * i / steps)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    return pts
+
+
+class Tooltip:
+    """A small hint that appears when the mouse rests on a widget."""
+
+    def __init__(self, widget, text, delay=600):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tip = None
+        self._after = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress-1>", self._hide, add="+")
+
+    def _schedule(self, event=None):
+        self._cancel()
+        self._after = self.widget.after(self.delay, self._show)
+
+    def _cancel(self):
+        if self._after:
+            try:
+                self.widget.after_cancel(self._after)
+            except Exception:
+                pass
+            self._after = None
+
+    def _show(self):
+        self._after = None
+        if self.tip or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            self.tip = tk.Toplevel(self.widget)
+            self.tip.wm_overrideredirect(True)
+            self.tip.configure(bg="#333333")
+            tk.Label(self.tip, text=self.text, bg="#333333", fg="#FFFFFF",
+                     font=MD_FONT_S, justify="left", padx=9, pady=6).pack()
+            self.tip.wm_geometry(f"+{x}+{y}")
+        except Exception:
+            self.tip = None
+
+    def _hide(self, event=None):
+        self._cancel()
+        if self.tip:
+            try:
+                self.tip.destroy()
+            except Exception:
+                pass
+            self.tip = None
+
+
+class MatButton(tk.Canvas):
+    """A Material-style button drawn on a canvas.
+
+    ttk buttons cannot do rounded corners or a flat filled look, so the action
+    buttons are drawn here: rounded rectangle, flat fill, no border, a darker
+    fill on hover and a pressed state.  The icon is a shape, not a character,
+    so it cannot fall back to a box on a machine without the right font.
+    """
+
+    def __init__(self, parent, text, command=None, variant="filled", icon=None,
+                 color=MD_PRIMARY, color_dark=MD_PRIMARY_D, tint=MD_PRIMARY_T,
+                 bg=MD_CARD, font=MD_FONT_B, height=40, padx=18, radius=10,
+                 tooltip=None):
+        self._text = text
+        self._cmd = command
+        self._variant = variant
+        self._icon = icon
+        self._color = color
+        self._dark = color_dark
+        self._tint = tint
+        self._bg = bg
+        self._font = font
+        self._enabled = True
+        self._hover = False
+        self._press = False
+        self._radius = radius
+        self._padx = padx
+        self._iw = 22 if icon else 0
+        self._tw = tkfont.Font(font=font).measure(text)
+        super().__init__(parent, width=self._width(), height=height, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<ButtonPress-1>", self._down)
+        self.bind("<ButtonRelease-1>", self._up)
+        self.bind("<Configure>", lambda e: self._draw())
+        self._draw()
+        if tooltip:
+            Tooltip(self, tooltip)
+
+    # ---- appearance ----
+    def _width(self):
+        return self._tw + self._iw + self._padx * 2 + (10 if self._icon else 0)
+
+    def _size(self):
+        """The real size, or the requested one while the widget is not mapped yet.
+
+        The requested width wins when it is the bigger of the two: a label that
+        just grew must not be drawn into the old, narrower canvas.
+        """
+        w = int(self["width"])
+        h = int(self["height"])
+        rw, rh = self.winfo_width(), self.winfo_height()
+        if rw > 1 and rw > w:
+            w = rw
+        if rh > 1 and rh > h:
+            h = rh
+        return w, h
+
+    def _draw(self):
+        self.delete("all")
+        w, h = self._size()
+        x0, y0, x1, y1 = 1, 1, w - 1, h - 1
+        if self._variant == "filled":
+            if self._enabled:
+                fill = self._dark if (self._hover or self._press) else self._color
+                fg = "#FFFFFF"
+            else:
+                fill, fg = MD_OFF_BG, MD_OFF_FG
+            self.create_polygon(_round_rect(x0, y0, x1, y1, self._radius),
+                                fill=fill, outline="", width=0)
+        elif self._variant == "outlined":
+            if self._enabled:
+                fill = self._tint if self._hover else self._bg
+                outline, fg = self._color, self._color
+            else:
+                fill, outline, fg = self._bg, "#DCDEE2", MD_OFF_FG
+            self.create_polygon(_round_rect(x0, y0, x1, y1, self._radius),
+                                fill=fill, outline=outline, width=1)
+        else:                                    # flat / text button
+            if self._enabled:
+                fill = self._tint if self._hover else self._bg
+                fg = self._color
+            else:
+                fill, fg = self._bg, MD_OFF_FG
+            if fill != self._bg:
+                self.create_polygon(_round_rect(x0, y0, x1, y1, self._radius),
+                                    fill=fill, outline="", width=0)
+        total = self._iw + (10 if self._icon else 0) + self._tw
+        sx = (w - total) / 2.0
+        if self._icon:
+            self._draw_icon(sx + self._iw / 2.0, h / 2.0, fg)
+            sx += self._iw + 10
+        self.create_text(sx, h / 2.0, text=self._text, fill=fg,
+                         font=self._font, anchor="w")
+
+    def _draw_icon(self, cx, cy, color):
+        if self._icon == "play":
+            self.create_polygon(cx - 6, cy - 8, cx + 8, cy, cx - 6, cy + 8,
+                                fill=color, outline="")
+        elif self._icon == "stop":
+            self.create_rectangle(cx - 7, cy - 7, cx + 7, cy + 7, fill=color, outline="")
+        elif self._icon == "restart":
+            r = 8
+            self.create_arc(cx - r, cy - r, cx + r, cy + r, start=50, extent=280,
+                            style=tk.ARC, outline=color, width=2)
+            self.create_polygon(cx + 1, cy - 10, cx + 10, cy - 5, cx + 2, cy - 1,
+                                fill=color, outline="")
+        else:
+            self.create_text(cx, cy, text=self._icon, fill=color, font=("Segoe UI", 11))
+
+    # ---- state ----
+    def set_enabled(self, enabled):
+        enabled = bool(enabled)
+        if enabled == self._enabled:
+            return
+        self._enabled = enabled
+        self.configure(cursor="hand2" if enabled else "arrow")
+        self._draw()
+
+    def set_text(self, text):
+        self._text = text
+        self._tw = tkfont.Font(font=self._font).measure(text)
+        self.configure(width=self._width())
+        self._draw()
+
+    # ---- mouse ----
+    def _enter(self, event=None):
+        self._hover = True
+        self._draw()
+
+    def _leave(self, event=None):
+        self._hover = False
+        self._press = False
+        self._draw()
+
+    def _down(self, event=None):
+        if not self._enabled:
+            return
+        self._press = True
+        self._draw()
+
+    def _up(self, event=None):
+        if not self._enabled:
+            return
+        was = self._press
+        self._press = False
+        self._draw()
+        if was and self._cmd:
+            self._cmd()
+
+
+class MatChip(tk.Canvas):
+    """A rounded status pill (Material chip) that shows the launcher state."""
+
+    def __init__(self, parent, text="", bg=MD_TEXT2, fg="#FFFFFF", font=MD_FONT_B,
+                 padx=14, height=30, canvas_bg=MD_BG, command=None, tooltip=None):
+        self._text = text
+        self._bg = bg
+        self._fg = fg
+        self._font = font
+        self._padx = padx
+        self._cmd = command
+        super().__init__(parent, width=tkfont.Font(font=font).measure(text) + padx * 2,
+                         height=height, bg=canvas_bg, highlightthickness=0, bd=0,
+                         cursor="hand2" if command else "arrow")
+        if command:
+            self.bind("<Button-1>", lambda e: self._cmd())
+        if tooltip:
+            Tooltip(self, tooltip)
+        self._draw()
+
+    def set(self, text, bg=None):
+        self._text = text
+        if bg:
+            self._bg = bg
+        self.configure(width=tkfont.Font(font=self._font).measure(text) + self._padx * 2)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        # The canvas is packed without fill, so the requested size is the real
+        # one.  Using it (and not winfo_width, which lags one redraw behind)
+        # is what keeps a longer label from being cut off.
+        w = int(self["width"])
+        h = int(self["height"])
+        self.create_polygon(_round_rect(1, 1, w - 1, h - 1, (h - 2) / 2),
+                            fill=self._bg, outline="")
+        self.create_text(w / 2, h / 2, text=self._text, fill=self._fg, font=self._font)
+
+
+class MatTab(tk.Canvas):
+    """One tab of a Material tab bar: a label, with an underline when it is active.
+
+    The ttk notebook draws its own tabs and ignores most of the theme, so the
+    tab bar is drawn here instead - then it looks the same as the rest of the
+    window on every Windows version.
+    """
+
+    def __init__(self, parent, text, command, bg=MD_CARD, font=MD_FONT, height=44):
+        self._text = text
+        self._cmd = command
+        self._bg = bg
+        self._font = font
+        self._active = False
+        self._hover = False
+        self._h = height
+        width = tkfont.Font(font=font).measure(text) + 36
+        super().__init__(parent, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.bind("<Enter>", self._enter)
+        self.bind("<Leave>", self._leave)
+        self.bind("<Button-1>", self._click)
+        self._draw()
+
+    def set_active(self, active):
+        active = bool(active)
+        if active != self._active:
+            self._active = active
+            self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        w = int(self["width"])
+        h = int(self["height"])
+        if self._active:
+            color = MD_PRIMARY
+        elif self._hover:
+            color = MD_TEXT
+        else:
+            color = MD_TEXT2
+        font = MD_FONT_B if self._active else self._font
+        self.create_text(w / 2, h / 2 - (2 if self._active else 0), text=self._text,
+                         fill=color, font=font)
+        if self._active:
+            self.create_rectangle(14, h - 3, w - 14, h - 1, fill=MD_PRIMARY, outline="")
+
+    def _enter(self, event=None):
+        self._hover = True
+        self._draw()
+
+    def _leave(self, event=None):
+        self._hover = False
+        self._draw()
+
+    def _click(self, event=None):
+        if self._cmd:
+            self._cmd()
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"Llama Launcher {APP_VERSION}")
-        self.geometry("940x800")
+        self.geometry(f"{WIN_W}x{WIN_H}")
         self.minsize(700, 480)
         self.proc = None
         self.gen = 0
+        # Administrator mode is what the full file-cache flush needs, so the
+        # mode is read once, before the window is built.
+        self.admin = is_admin()
         self.q = queue.Queue()
         self._reset_mem()
         self.mem_est = {}
         self.gpu_mem = None
         self._gpu_warned = False
         self.tuning = False
+        self.starting = False   # the launcher is bringing a model up
         self.auto_preset = None
         self.auto_cancel = None
         self.auto_q = None
@@ -1315,9 +1707,9 @@ class App(tk.Tk):
         self.sampling_mode = tk.StringVar(value="Normal (publisher settings)")
         self.run_mode = None          # sampling mode the running server was started with
         self.port = tk.StringVar(value=DEFAULT_PORT)
-        self.choice = tk.StringVar(value=PRESETS[0]["name"])
+        self.choice = tk.StringVar(value=NO_PRESET)
         self._build_ui()
-        self._set_status("Stopped", "#888888")
+        self._set_status("Stopped", MD_TEXT2)
         # First line of every run: which copy is this, and where does it look.
         self._log(f"[launcher] version {APP_VERSION} | file: {os.path.abspath(__file__)} | "
                   f"BASE_DIR: {BASE_DIR} | {len(PRESETS)} presets")
@@ -1343,82 +1735,404 @@ class App(tk.Tk):
         threading.Thread(target=self._gpu_loop, daemon=True).start()
         self.after(100, self._drain)
         self.after(1000, self._tick)
+        # The start-mode question comes up over the window, not instead of it:
+        # a dialog that belongs to a hidden window is not shown reliably on
+        # every Windows version, and then the launcher would look like it
+        # starts without asking.
+        self.after(80, self._ask_start_mode)
+
+    def report_callback_exception(self, exc, val, tb):
+        """Show an error instead of writing it to a console nobody sees.
+
+        A .pyw has no console window, so an error in a button handler would
+        otherwise disappear without a trace.
+        """
+        detail = "".join(traceback.format_exception(type(val), val, tb))
+        path = write_error_log(detail)
+        try:
+            messagebox.showerror(
+                "Llama Launcher",
+                f"Something went wrong:\n\n{val}\n\n"
+                f"The details were written to:\n{path}")
+        except Exception:
+            pass
+
+    def _card(self, parent=None, bg=MD_CARD):
+        """A Material card: flat surface, 1 px outline, no shadow."""
+        return tk.Frame(parent or self, bg=bg, highlightbackground=MD_OUTLINE,
+                        highlightthickness=1, bd=0)
+
+    def _show_main_window(self):
+        """Make sure the launcher is on screen.
+
+        Used when the elevation fails: the launcher has to stay usable, so
+        the window is brought back and the buttons are put in the right state.
+        """
+        try:
+            if not self.winfo_ismapped():
+                self.deiconify()
+        except Exception:
+            pass
+        self._sync_buttons()
+
+    def _ask_start_mode(self):
+        """At startup: start normally, or as administrator.
+
+        Administrator mode is what the full file-cache flush needs.  Asking
+        once, up front, beats finding out later that a button does nothing.
+        A launcher that is already running as administrator skips the question.
+
+        The question is shown over the main window on purpose.  A dialog that
+        belongs to a hidden window is not shown reliably on every Windows
+        version, which is why the window stays visible here.
+        """
+        self._center_on_screen()
+        if self.admin:
+            self._sync_buttons()
+            return
+        mode = None
+        try:
+            dlg = tk.Toplevel(self)
+            dlg.withdraw()
+            dlg.title("Llama Launcher")
+            dlg.configure(bg=MD_BG)
+            dlg.resizable(False, False)
+            dlg.transient(self)
+            inner = tk.Frame(dlg, bg=MD_BG)
+            inner.pack(fill="both", expand=True, padx=28, pady=24)
+            tk.Label(inner, text="Llama Launcher", bg=MD_BG, fg=MD_TEXT,
+                     font=("Segoe UI", 15, "bold")).pack(anchor="w")
+            tk.Label(inner, text="How do you want to start?", bg=MD_BG, fg=MD_TEXT,
+                     font=MD_FONT_B).pack(anchor="w", pady=(12, 6))
+            tk.Label(inner, text=("Administrator mode lets the launcher clear the Windows file cache "
+                                   "and free up RAM. Everything else works the same in both modes."),
+                     bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S, justify="left", wraplength=400,
+                     anchor="w").pack(anchor="w")
+            row = tk.Frame(inner, bg=MD_BG)
+            row.pack(fill="x", pady=(20, 0))
+            MatButton(row, "Start normally", command=lambda: self._start_choice(dlg, "normal"),
+                      color=MD_PRIMARY, color_dark=MD_PRIMARY_D, bg=MD_BG,
+                      tooltip="Start without administrator rights. The file-cache flush stays "
+                              "unavailable.").pack(side="left", padx=(0, 10))
+            MatButton(row, "Start as administrator", command=lambda: self._start_choice(dlg, "admin"),
+                      variant="outlined", color=MD_PRIMARY, color_dark=MD_PRIMARY_D,
+                      tint=MD_PRIMARY_T, bg=MD_BG,
+                      tooltip="Windows will ask you to confirm. Then the file-cache flush "
+                              "works too.").pack(side="left")
+            dlg.protocol("WM_DELETE_WINDOW", lambda: self._start_choice(dlg, None))
+            self._start_dialog = dlg
+            dlg.update_idletasks()
+            self._center_dialog(dlg)
+            dlg.deiconify()
+            try:
+                dlg.grab_set()
+                dlg.focus_force()
+            except Exception:
+                pass
+            # Insurance: if the question does not really get on screen, it is
+            # closed and the launcher carries on.  A question that is on screen
+            # is never touched, however long the user takes to answer it.
+            self.after(6000, self._dialog_safety)
+            self.wait_window(dlg)
+            mode = getattr(self, "_start_mode", None)
+        except Exception as e:
+            write_error_log(traceback.format_exc())
+            self._log(f"[launcher] the start-mode question could not be shown ({e}); "
+                      f"starting as a standard user.")
+            mode = None
+        if mode == "admin":
+            self._relaunch_admin(confirm=False)      # starts the elevated copy
+            return
+        self._sync_buttons()
+
+    def _dialog_safety(self):
+        """Bring the launcher back if the start-mode question never appeared."""
+        dlg = getattr(self, "_start_dialog", None)
+        if dlg is None:
+            return
+        try:
+            if not dlg.winfo_exists():
+                return                      # the question was answered already
+            if dlg.winfo_ismapped():
+                return                      # the question is on screen: leave it
+        except Exception:
+            return
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        self._start_mode = None
+        self._log("[launcher] the start-mode question did not come up; starting as a standard user.")
+        self._show_main_window()
+
+    def _start_choice(self, dlg, mode):
+        self._start_mode = mode
+        try:
+            # Deferred: the click is still being handled by a widget inside
+            # this dialog, so the window is closed one step later.
+            self.after_idle(dlg.destroy)
+        except Exception:
+            pass
+
+    def _center_dialog(self, dlg):
+        """Put the question in the middle of the launcher window."""
+        try:
+            dlg.update_idletasks()
+            # Before the dialog is on screen winfo_width() is still 1, so the
+            # requested size is the one to use.
+            w = dlg.winfo_reqwidth()
+            h = dlg.winfo_reqheight()
+            x = self.winfo_rootx() + (self.winfo_width() - w) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - h) // 3
+            dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+    def _center_on_screen(self):
+        """Put the launcher in the middle of the screen - position only."""
+        try:
+            self.update_idletasks()
+            w = self.winfo_width() if self.winfo_width() > 1 else WIN_W
+            h = self.winfo_height() if self.winfo_height() > 1 else WIN_H
+            x = (self.winfo_screenwidth() - w) // 2
+            y = (self.winfo_screenheight() - h) // 3
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
 
     def _build_ui(self):
-        pad = {"padx": 10, "pady": 6}
-        top = ttk.Frame(self)
-        top.pack(fill="x", **pad)
-        ttk.Label(top, text="Model preset:").pack(side="left")
-        self.combo = ttk.Combobox(top, textvariable=self.choice, state="readonly",
-                                  values=[p["name"] for p in PRESETS], width=60,
-                                  height=len(PRESETS))  # show every preset without scrolling
-        self.combo.pack(side="left", padx=8, fill="x", expand=True)
-        self.combo.bind("<<ComboboxSelected>>", lambda e: self._update_cmd())
-        ttk.Label(top, text="Port:").pack(side="left", padx=(8, 2))
-        port = ttk.Entry(top, textvariable=self.port, width=6)
-        port.pack(side="left")
-        port.bind("<KeyRelease>", lambda e: self._update_cmd())
-        self.cmd_label = ttk.Label(self, text="", foreground="#666", wraplength=860, justify="left")
-        self.cmd_label.pack(fill="x", padx=10)
-        self.cmd_label.bind("<Configure>", self._fit_cmd_wrap)
-        btns = ttk.Frame(self)
-        btns.pack(fill="x", **pad)
-        style = ttk.Style()
-        style.configure("Big.TButton", font=("Segoe UI", 11, "bold"), padding=8)
-        self.start_btn = ttk.Button(btns, text="▶  START", style="Big.TButton", command=self.start)
-        self.start_btn.pack(side="left", padx=(0, 6))
-        self.stop_btn = ttk.Button(btns, text="■  STOP", style="Big.TButton", command=self.stop)
-        self.stop_btn.pack(side="left", padx=6)
-        ttk.Button(btns, text="⟳  RESTART", style="Big.TButton", command=self.start).pack(side="left", padx=6)
-        ttk.Button(btns, text="🧹  FLUSH FILE CACHE", style="Big.TButton", command=self.clear_ram).pack(side="left", padx=6)
-        ttk.Button(btns, text="📋  CLEANER…", style="Big.TButton", command=self.open_cleaner).pack(side="left", padx=6)
-        opts = ttk.Frame(self)
-        opts.pack(fill="x", padx=10)
-        ttk.Checkbutton(opts, text="Auto-flush Windows file cache after Stop (opt-in)", variable=self.auto_clear).pack(side="left")
-        if not is_admin():
-            ttk.Button(opts, text="Restart as Admin (enables full RAM flush)", command=self._relaunch_admin).pack(side="right")
+        self.configure(bg=MD_BG)
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", font=MD_FONT, background=MD_BG, foreground=MD_TEXT)
+        style.configure("TLabel", background=MD_BG, foreground=MD_TEXT)
+        style.configure("Card.TLabel", background=MD_CARD, foreground=MD_TEXT)
+        style.configure("CardDim.TLabel", background=MD_CARD, foreground=MD_TEXT2)
+        style.configure("Dim.TLabel", background=MD_BG, foreground=MD_TEXT2)
+        style.configure("TCombobox", fieldbackground=MD_CARD, background=MD_CARD,
+                        foreground=MD_TEXT, bordercolor=MD_OUTLINE, lightcolor=MD_OUTLINE,
+                        darkcolor=MD_OUTLINE, arrowsize=14, padding=(8, 7), font=MD_FONT)
+        style.map("TCombobox", fieldbackground=[("readonly", MD_CARD)],
+                  foreground=[("readonly", MD_TEXT)])
+        style.configure("TEntry", fieldbackground=MD_CARD, foreground=MD_TEXT,
+                        bordercolor=MD_OUTLINE, lightcolor=MD_OUTLINE,
+                        darkcolor=MD_OUTLINE, insertcolor=MD_TEXT, padding=6, font=MD_FONT)
+        style.configure("TCheckbutton", background=MD_CARD, foreground=MD_TEXT)
+        style.map("TCheckbutton", background=[("active", MD_CARD)])
+        style.configure("TProgressbar", background=MD_PRIMARY, troughcolor=MD_SURFACE,
+                        bordercolor=MD_SURFACE, lightcolor=MD_PRIMARY, darkcolor=MD_PRIMARY)
+        style.configure("TButton", background=MD_CARD, foreground=MD_TEXT,
+                        bordercolor=MD_OUTLINE, lightcolor=MD_CARD, darkcolor=MD_CARD,
+                        focuscolor=MD_CARD, padding=(14, 8), font=MD_FONT)
+        style.map("TButton", background=[("active", MD_SURFACE), ("pressed", MD_OUTLINE)])
+        style.configure("Treeview", background=MD_CARD, fieldbackground=MD_CARD,
+                        foreground=MD_TEXT, borderwidth=0, rowheight=26)
+        style.map("Treeview", background=[("selected", MD_PRIMARY_T)],
+                  foreground=[("selected", MD_TEXT)])
+        style.configure("Treeview.Heading", background=MD_SURFACE, foreground=MD_TEXT2,
+                        font=MD_FONT_SB, relief="flat", borderwidth=0, padding=(6, 6))
+        style.map("Treeview.Heading", background=[("active", MD_SURFACE)])
+        style.configure("Vertical.TScrollbar", background="#C9CED6", troughcolor="#F1F2F4",
+                        bordercolor="#C9CED6", darkcolor="#C9CED6", lightcolor="#C9CED6",
+                        arrowcolor=MD_TEXT2, borderwidth=0, arrowsize=11)
+
+        # ---- header: title on the left, state on the right ----------------
+        head = tk.Frame(self, bg=MD_BG)
+        head.pack(fill="x", padx=20, pady=(18, 10))
+        tk.Label(head, text="Llama Launcher", bg=MD_BG, fg=MD_TEXT,
+                 font=("Segoe UI", 18, "bold")).pack(side="left")
+        tk.Label(head, text=f"v{APP_VERSION}   ·   {len(PRESETS)} presets   ·   {BASE_DIR}",
+                 bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S, anchor="w").pack(side="left", padx=(12, 0), pady=(9, 0))
+        self.status = MatChip(head, "Stopped", bg=MD_TEXT2, canvas_bg=MD_BG)
+        self.status.pack(side="right")
+        # The mode badge says up front what this launcher can and cannot do.
+        # It is a label, not a button: the way to change the mode is the
+        # "START AS ADMINISTRATOR" button, so that a badge that says
+        # "Standard user" never does something surprising when it is clicked.
+        if self.admin:
+            self.mode_chip = MatChip(
+                head, "Administrator", bg=MD_TEAL, canvas_bg=MD_BG,
+                tooltip="Running as administrator: the Windows file cache can be cleared "
+                        "and RAM can be flushed.")
         else:
-            ttk.Label(opts, text="Running as admin ✔", foreground="#2e8b57").pack(side="right")
-        opts2 = ttk.Frame(self)
-        opts2.pack(fill="x", padx=10, pady=(0, 4))
-        ttk.Label(opts2, text="Sampling:").pack(side="left", padx=(0, 4))
-        self.sampling_box = ttk.Combobox(opts2, textvariable=self.sampling_mode, state="readonly",
+            self.mode_chip = MatChip(
+                head, "Standard user", bg=MD_TEXT2, canvas_bg=MD_BG,
+                tooltip="Running as a standard user: the Windows file cache cannot be "
+                        "cleared. Use START AS ADMINISTRATOR for that.")
+        self.mode_chip.pack(side="right", padx=(0, 8))
+
+        # ---- card 1: which model, on which port ---------------------------
+        mcard = self._card()
+        mcard.pack(fill="x", padx=20, pady=(0, 10))
+        m_in = tk.Frame(mcard, bg=MD_CARD)
+        m_in.pack(fill="x", padx=18, pady=16)
+        row = tk.Frame(m_in, bg=MD_CARD)
+        row.pack(fill="x")
+        tk.Label(row, text="Model preset", bg=MD_CARD, fg=MD_TEXT, font=MD_FONT_B).pack(side="left")
+        self.combo = ttk.Combobox(row, textvariable=self.choice, state="readonly",
+                                  values=[NO_PRESET] + [p["name"] for p in PRESETS],
+                                  height=14)
+        self.combo.pack(side="left", padx=(14, 16), fill="x", expand=True)
+        self.combo.bind("<<ComboboxSelected>>", lambda e: self._preset_changed())
+        tk.Label(row, text="Port", bg=MD_CARD, fg=MD_TEXT, font=MD_FONT_B).pack(side="left")
+        port = ttk.Entry(row, textvariable=self.port, width=8)
+        port.pack(side="left", padx=(10, 0))
+        port.bind("<KeyRelease>", lambda e: self._update_cmd())
+
+        cmd_box = tk.Frame(m_in, bg=MD_SURFACE, highlightbackground=MD_OUTLINE,
+                           highlightthickness=1, bd=0)
+        cmd_box.pack(fill="x", pady=(14, 0))
+        self.cmd_label = tk.Label(cmd_box, text="", bg=MD_SURFACE, fg=MD_TEXT2,
+                                  font=MD_FONT_MONO, justify="left", anchor="w",
+                                  wraplength=880, padx=14, pady=11)
+        self.cmd_label.pack(fill="x")
+        self.cmd_label.bind("<Configure>", self._fit_cmd_wrap)
+
+        # ---- card 2: what to do -------------------------------------------
+        acard = self._card()
+        acard.pack(fill="x", padx=20, pady=(0, 10))
+        a_in = tk.Frame(acard, bg=MD_CARD)
+        a_in.pack(fill="x", padx=18, pady=16)
+        btns = tk.Frame(a_in, bg=MD_CARD)
+        btns.pack(fill="x")
+        self.start_btn = MatButton(btns, "START", command=self.start, icon="play",
+                                   color=MD_PRIMARY, color_dark=MD_PRIMARY_D,
+                                   bg=MD_CARD, tooltip="Start the selected model preset.")
+        self.start_btn.pack(side="left", padx=(0, 10))
+        self.stop_btn = MatButton(btns, "STOP", command=self.stop, icon="stop",
+                                  variant="outlined", color=MD_ERROR, color_dark=MD_ERROR_D,
+                                  tint=MD_ERROR_T, bg=MD_CARD,
+                                  tooltip="Stop the running model. During auto-tuning it cancels the tuning.")
+        self.stop_btn.pack(side="left", padx=(0, 10))
+        self.restart_btn = MatButton(btns, "RESTART", command=self._restart, icon="restart",
+                                     variant="outlined", color=MD_PRIMARY, color_dark=MD_PRIMARY_D,
+                                     tint=MD_PRIMARY_T, bg=MD_CARD,
+                                     tooltip="Restart the running model with the settings on screen - "
+                                             "use it after changing Sampling.")
+        self.restart_btn.pack(side="left")
+        tk.Frame(btns, bg=MD_CARD).pack(side="left", fill="x", expand=True)
+        if self.admin:
+            self.cache_btn = MatButton(btns, "CLEAR FILE CACHE", command=self.clear_ram,
+                                       variant="text", color=MD_TEAL, color_dark=MD_TEAL_D,
+                                       tint=MD_TEAL_T, bg=MD_CARD, font=MD_FONT,
+                                       tooltip="Ask Windows to drop the file cache, so the model "
+                                               "files are read from disk again.")
+            self.cache_btn.pack(side="left", padx=(0, 6))
+        else:
+            # The flush needs administrator rights, so the button is not shown
+            # at all - a button that does nothing is worse than no button.
+            tk.Label(btns, text="File-cache flush needs administrator mode",
+                     bg=MD_CARD, fg=MD_TEXT2, font=MD_FONT_S).pack(side="left", padx=(0, 12))
+        self.ram_btn = MatButton(btns, "FREE RAM", command=self.open_free_ram,
+                                 variant="text", color=MD_TEAL, color_dark=MD_TEAL_D,
+                                 tint=MD_TEAL_T, bg=MD_CARD, font=MD_FONT,
+                                 tooltip="List the apps using memory and let them give some back. "
+                                         "This works in both modes.")
+        self.ram_btn.pack(side="left")
+
+        opts = tk.Frame(a_in, bg=MD_CARD)
+        opts.pack(fill="x", pady=(16, 0))
+        tk.Label(opts, text="Sampling", bg=MD_CARD, fg=MD_TEXT, font=MD_FONT_B).pack(side="left")
+        self.sampling_box = ttk.Combobox(opts, textvariable=self.sampling_mode, state="readonly",
                                          values=list(SAMPLING_MODES), width=28)
-        self.sampling_box.pack(side="left")
+        self.sampling_box.pack(side="left", padx=(14, 10))
         self.sampling_box.bind("<<ComboboxSelected>>", lambda e: self._sampling_changed())
-        ttk.Label(opts2, text="Changes how the model writes. Presets stay publisher-official.",
-                  foreground="#666").pack(side="left", padx=(8, 0))
-        stat = ttk.Frame(self)
-        stat.pack(fill="x", **pad)
-        self.status = tk.Label(stat, text="", fg="white", font=("Segoe UI", 10, "bold"), padx=12, pady=3)
-        self.status.pack(side="left")
-        self.ram_label = ttk.Label(stat, text="")
-        self.ram_label.pack(side="left", padx=14)
-        self.vram_label = ttk.Label(stat, text="")
-        self.vram_label.pack(side="left")
-        ttk.Button(stat, text="Clear log", command=lambda: self.log.delete("1.0", "end")).pack(side="right")
-        self.copy_btn = ttk.Button(stat, text="Copy log", command=self._copy_log)
-        self.copy_btn.pack(side="right", padx=(0, 6))
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-        logf = ttk.Frame(self.nb)
-        memf = ttk.Frame(self.nb)
-        self.nb.add(logf, text="  Log  ")
-        self.nb.add(memf, text="  Memory breakdown  ")
-        self._build_mem_tab(memf)
-        self.log = tk.Text(logf, bg="#111", fg="#ddd", font=("Consolas", 9), wrap="word", insertbackground="white")
-        sb = ttk.Scrollbar(logf, command=self.log.yview)
+        tk.Label(opts, text="Changes how the model writes. Presets stay publisher-official.",
+                 bg=MD_CARD, fg=MD_TEXT2, font=MD_FONT_S).pack(side="left")
+
+        opts2 = tk.Frame(a_in, bg=MD_CARD)
+        opts2.pack(fill="x", pady=(10, 0))
+        if self.admin:
+            ttk.Checkbutton(opts2, text="Clear the Windows file cache automatically after Stop",
+                            variable=self.auto_clear).pack(side="left")
+        else:
+            tk.Label(opts2, text="Automatic file-cache flush is available in administrator mode",
+                     bg=MD_CARD, fg=MD_TEXT2, font=MD_FONT_S).pack(side="left")
+        if not self.admin:
+            MatButton(opts2, "START AS ADMINISTRATOR", command=self._relaunch_admin,
+                      variant="text", color=MD_PRIMARY, color_dark=MD_PRIMARY_D,
+                      tint=MD_PRIMARY_T, bg=MD_CARD, height=28, font=MD_FONT_SB,
+                      tooltip="Close this window and open the launcher as administrator. "
+                              "A running model is stopped for that.").pack(side="right")
+        else:
+            tk.Label(opts2, text="Running as administrator", bg=MD_CARD, fg=MD_OK,
+                     font=MD_FONT_SB).pack(side="right")
+
+        # ---- status line + log tools --------------------------------------
+        stat = tk.Frame(self, bg=MD_BG)
+        stat.pack(fill="x", padx=20, pady=(0, 8))
+        self.ram_label = tk.Label(stat, text="", bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S)
+        self.ram_label.pack(side="left")
+        self.vram_label = tk.Label(stat, text="", bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S)
+        self.vram_label.pack(side="left", padx=(16, 0))
+        self.copy_btn = MatButton(stat, "COPY LOG", command=self._copy_log,
+                                  variant="text", color=MD_PRIMARY, color_dark=MD_PRIMARY_D,
+                                  tint=MD_PRIMARY_T, bg=MD_BG, height=28, font=MD_FONT_SB)
+        self.copy_btn.pack(side="right")
+        self.clearlog_btn = MatButton(stat, "CLEAR LOG", command=self._clear_log,
+                                      variant="text", color=MD_TEXT2, color_dark=MD_TEXT,
+                                      tint="#EDEFF2", bg=MD_BG, height=28, font=MD_FONT_SB)
+        self.clearlog_btn.pack(side="right", padx=(0, 4))
+
+        # ---- tabs: Log / Memory breakdown ---------------------------------
+        tab_card = self._card()
+        tab_card.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+        bar = tk.Frame(tab_card, bg=MD_CARD)
+        bar.pack(fill="x", side="top")
+        tk.Frame(tab_card, bg=MD_OUTLINE, height=1).pack(fill="x", side="top")
+        content = tk.Frame(tab_card, bg=MD_CARD)
+        content.pack(fill="both", expand=True)
+        self._pages, self._tabs = {}, {}
+        for key, label in (("log", "Log"), ("mem", "Memory breakdown")):
+            page = tk.Frame(content, bg=MD_CARD)
+            self._pages[key] = page
+            tab = MatTab(bar, label, command=lambda k=key: self._show_tab(k))
+            tab.pack(side="left", padx=(4, 0))
+            self._tabs[key] = tab
+
+        log_page = self._pages["log"]
+        log_box = tk.Frame(log_page, bg=MD_SURFACE, highlightbackground=MD_OUTLINE,
+                           highlightthickness=1, bd=0)
+        log_box.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+        self.log = tk.Text(log_box, bg=MD_SURFACE, fg="#2B313A", font=("Consolas", 10),
+                           wrap="word", insertbackground=MD_TEXT, relief="flat", bd=0,
+                           highlightthickness=0, padx=16, pady=14, spacing1=1, spacing3=3)
+        sb = ttk.Scrollbar(log_box, command=self.log.yview, style="Vertical.TScrollbar")
         self.log.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         self.log.pack(side="left", fill="both", expand=True)
+
+        self._build_mem_tab(self._pages["mem"])
+        self._show_tab("log")
         self._update_cmd()
+
+    def _show_tab(self, key):
+        """Show one tab and hide the other."""
+        for k, page in self._pages.items():
+            if k == key:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+        for k, tab in self._tabs.items():
+            tab.set_active(k == key)
+
+    def _clear_log(self):
+        self.log.delete("1.0", "end")
+
+    def _preset_changed(self):
+        """A preset was picked (or cleared) in the dropdown."""
+        self._update_cmd()
+        self._sync_buttons()
 
     def _copy_log(self):
         self.clipboard_clear()
         self.clipboard_append(self.log.get("1.0", "end-1c"))
         self.update()
-        self.copy_btn.config(text="Copied ✓")
-        self.after(1500, lambda: self.copy_btn.config(text="Copy log"))
+        self.copy_btn.set_text("Copied")
+        self.after(1500, lambda: self.copy_btn.set_text("COPY LOG"))
 
     def _coding_hint(self, p):
         """Say what the launcher can do for code output, once per preset change.
@@ -1482,15 +2196,18 @@ class App(tk.Tk):
 
     def _build_mem_tab(self, parent):
         try:
-            self._bar_font = tk.font.Font(font=("Segoe UI", 8, "bold"))
+            self._bar_font = tkfont.Font(font=("Segoe UI", 8, "bold"))
         except Exception:
             self._bar_font = None
-        canvas = tk.Canvas(parent, highlightthickness=0)
-        vbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        wrap = tk.Frame(parent, bg=MD_CARD)
+        wrap.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+        canvas = tk.Canvas(wrap, highlightthickness=0, bg=MD_CARD)
+        vbar = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview,
+                             style="Vertical.TScrollbar")
         canvas.configure(yscrollcommand=vbar.set)
         vbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-        inner = ttk.Frame(canvas)
+        inner = tk.Frame(canvas, bg=MD_CARD)
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
@@ -1506,42 +2223,50 @@ class App(tk.Tk):
         self._mem_wheel = _mem_wheel
         self.bind_all("<MouseWheel>", _mem_wheel, add="+")
 
-        self.mem_info = ttk.Label(inner, text="", font=("Segoe UI", 9, "bold"), wraplength=820, justify="left")
-        self.mem_info.pack(fill="x", padx=8, pady=(8, 0))
-        self.mem_canvas = tk.Canvas(inner, height=34, bg="#eeeeee", highlightthickness=1, highlightbackground="#bbbbbb")
-        self.mem_canvas.pack(fill="x", padx=8, pady=(10, 4))
+        self.mem_info = tk.Label(inner, text="", bg=MD_CARD, fg=MD_TEXT,
+                                 font=MD_FONT_B, wraplength=820, justify="left", anchor="w")
+        self.mem_info.pack(fill="x", pady=(0, 12))
+        self.mem_canvas = tk.Canvas(inner, height=30, bg=MD_SURFACE, highlightthickness=1,
+                                    highlightbackground=MD_OUTLINE)
+        self.mem_canvas.pack(fill="x", pady=(0, 12))
         self.mem_canvas.bind("<Configure>", lambda e: self._refresh_mem())
-        self.mem_note = ttk.Label(inner, text="", foreground="#b03030", wraplength=820, justify="left")
-        self.mem_note.pack(fill="x", padx=8)
-        grid = ttk.Frame(inner)
-        grid.pack(fill="x", padx=8, pady=6)
-        grid.columnconfigure(1, weight=0, minsize=140)
-        grid.columnconfigure(2, weight=0, minsize=190)
+        self.mem_note = tk.Label(inner, text="", bg=MD_CARD, fg=MD_ERROR,
+                                 wraplength=820, justify="left", anchor="w")
+        self.mem_note.pack(fill="x")
+        grid = tk.Frame(inner, bg=MD_CARD)
+        grid.pack(fill="x", pady=(12, 4))
+        grid.columnconfigure(1, weight=0, minsize=150)
+        grid.columnconfigure(2, weight=0, minsize=200)
         grid.columnconfigure(3, weight=1)
         self.mem_rows = {}
         for i, (key, name, color, desc) in enumerate(COMPONENTS):
-            tk.Label(grid, bg=color, width=2).grid(row=i, column=0, padx=(0, 6), pady=3, sticky="nw")
-            ttk.Label(grid, text=name, font=("Segoe UI", 9, "bold"), wraplength=140).grid(row=i, column=1, sticky="nw", padx=(0, 10))
-            size = ttk.Label(grid, text="—", justify="left", wraplength=190)
-            size.grid(row=i, column=2, sticky="nw", padx=(0, 10))
-            desc_label = ttk.Label(grid, text=desc, wraplength=380, foreground="#555", justify="left")
+            tk.Label(grid, bg=color, width=2).grid(row=i, column=0, padx=(0, 10), pady=5, sticky="nw")
+            tk.Label(grid, text=name, bg=MD_CARD, fg=MD_TEXT, font=MD_FONT_B,
+                     wraplength=150, justify="left", anchor="w").grid(row=i, column=1, sticky="nw", padx=(0, 16))
+            size = tk.Label(grid, text="—", bg=MD_CARD, fg=MD_TEXT, font=MD_FONT,
+                            wraplength=200, justify="left", anchor="w")
+            size.grid(row=i, column=2, sticky="nw", padx=(0, 16))
+            desc_label = tk.Label(grid, text=desc, bg=MD_CARD, fg=MD_TEXT2, font=MD_FONT_S,
+                                  wraplength=380, justify="left", anchor="w")
             desc_label.grid(row=i, column=3, sticky="nw")
             self.mem_rows[key] = size
             if not hasattr(self, "mem_desc"):
                 self.mem_desc = {}
             self.mem_desc[key] = desc_label
-        ttk.Separator(inner).pack(fill="x", padx=8, pady=4)
-        self.mem_totals = ttk.Label(inner, text="", font=("Consolas", 10), justify="left")
-        self.mem_totals.pack(anchor="w", padx=8)
-        self.mem_hint = ttk.Label(inner, text="", foreground="#555", wraplength=820, justify="left")
-        self.mem_hint.pack(fill="x", padx=8, pady=(6, 12))
+        tk.Frame(inner, bg=MD_OUTLINE, height=1).pack(fill="x", pady=(8, 10))
+        self.mem_totals = tk.Label(inner, text="", bg=MD_CARD, fg=MD_TEXT,
+                                   font=("Consolas", 10), justify="left", anchor="w")
+        self.mem_totals.pack(anchor="w")
+        self.mem_hint = tk.Label(inner, text="", bg=MD_CARD, fg=MD_TEXT2, font=MD_FONT_S,
+                                 wraplength=820, justify="left", anchor="w")
+        self.mem_hint.pack(fill="x", pady=(8, 0))
         self._refresh_mem()
         inner.bind("<Configure>", self._fit_mem_wrap)
 
     def _fit_cmd_wrap(self, event):
         """Wrap the command line to the window width instead of a fixed number."""
         try:
-            w = max(200, event.width - 12)
+            w = max(200, event.width - 28)
             if w != getattr(self, "_cmd_wrap_w", None):
                 self._cmd_wrap_w = w
                 self.cmd_label.configure(wraplength=w)
@@ -1555,8 +2280,8 @@ class App(tk.Tk):
             if w == getattr(self, "_mem_wrap_w", None):
                 return
             self._mem_wrap_w = w
-            full = max(240, w - 20)      # labels that span the whole tab
-            desc = max(240, w - 400)     # description column: tab minus the fixed columns
+            full = max(240, w - 10)      # labels that span the whole tab
+            desc = max(240, w - 420)     # description column: tab minus the fixed columns
             for lbl in getattr(self, "mem_desc", {}).values():
                 lbl.configure(wraplength=desc)
             self.mem_info.configure(wraplength=full)
@@ -1755,6 +2480,21 @@ class App(tk.Tk):
         return "Memory the app needs for itself. It is not for the model and not for the chat. It stays the same after start."
 
     def _refresh_mem(self):
+        if self._selected() is None:
+            # No preset picked yet: nothing to measure.
+            self.mem_info.config(text="Select a model preset to see its weights and memory estimate.")
+            self.mem_note.config(text="")
+            self.mem_totals.config(text="")
+            self.mem_hint.config(text="")
+            for key, label in self.mem_rows.items():
+                label.config(text="—")
+            c = self.mem_canvas
+            c.delete("all")
+            w = max(c.winfo_width(), 100)
+            ch = c.winfo_height() if c.winfo_height() > 1 else 30
+            c.create_text(w / 2, ch / 2, text="Pick a preset to see its weights and KV estimate",
+                          fill=MD_TEXT2)
+            return
         mem = self.mem
         try:
             cmd = self._build_cmd()
@@ -1907,10 +2647,12 @@ class App(tk.Tk):
         c = self.mem_canvas
         c.delete("all")
         w = max(c.winfo_width(), 100)
+        ch = c.winfo_height() if c.winfo_height() > 1 else 30
         order = ("model", "kv", "rs", "compute", "output", "cache", "other")
         total = sum(best.get(k, 0) for k in order)
         if total <= 0:
-            c.create_text(w / 2, 17, text="Pick a preset to see its weights and KV estimate", fill="#777")
+            c.create_text(w / 2, ch / 2, text="Pick a preset to see its weights and KV estimate",
+                          fill=MD_TEXT2)
             return
         colors = {k: col for k, _, col, _ in COMPONENTS}
         x = 1
@@ -1919,12 +2661,13 @@ class App(tk.Tk):
             if v <= 0:
                 continue
             seg = (w - 2) * v / total
-            c.create_rectangle(x, 1, x + seg, 34, fill=colors[k], outline="white")
+            c.create_rectangle(x, 1, x + seg, ch - 1, fill=colors[k], outline="white")
             # Only write the name if it really fits. A long name in a narrow
             # segment used to be cut off mid-word ("Compute buffe").
             label = BAR_NAMES.get(k, k)
             if self._bar_fits(label, seg):
-                c.create_text(x + seg / 2, 17, text=label, fill="white", font=("Segoe UI", 8, "bold"))
+                c.create_text(x + seg / 2, ch / 2, text=label, fill="white",
+                              font=("Segoe UI", 8, "bold"))
             x += seg
 
     def _bar_fits(self, label, seg):
@@ -1949,7 +2692,7 @@ class App(tk.Tk):
         self.auto_cancel = threading.Event()
         self.auto_q = queue.Queue()
         self._set_run_state("tuning")
-        self._set_status("Auto-tuning NGL…", "#d98c00")
+        self._set_status("Auto-tuning NGL…", MD_WARN)
         self._log(f"\n=== Auto-tuning NGL for {p['name']} (port {port}): {reason} ===")
         self._log("[auto ngl] each trial loads the model; big models take several minutes")
         threading.Thread(target=auto_tune_ngl,
@@ -1986,8 +2729,13 @@ class App(tk.Tk):
             self._log(f"[auto ngl] RESULT: -ngl {ngl} loads and answers a long prompt{spare} ({saved}). Starting…")
             self.choice.set(p["name"])          # START must use the preset that was tuned
             self._update_cmd()
-            self._set_status("Stopped", "#888888")
-            self._set_run_state("stopped")
+            # Straight from "tuning" into "starting".  Going through "stopped"
+            # here would put the buttons in the stopped look for the moment
+            # the RAM wait repaints the window, and then flip them again when
+            # the server appears.
+            self.starting = True
+            self._set_status("Starting…", MD_WARN)
+            self._sync_buttons()
             self.start()                        # the saved value is used from here on
             return
         if kind == "failed":
@@ -1995,7 +2743,7 @@ class App(tk.Tk):
             messagebox.showerror("Auto-tuning NGL failed", item[1])
         else:
             self._log("[auto ngl] cancelled; nothing saved")
-        self._set_status("Stopped", "#888888")
+        self._set_status("Stopped", MD_TEXT2)
         self._set_run_state("stopped")
         self._update_cmd()
 
@@ -2070,7 +2818,7 @@ class App(tk.Tk):
         if not lower:
             self._log(f"[auto ngl] out of memory at -ngl {cur}, and nothing lower is left. "
                       f"Lower the context or free RAM, then START again.")
-            self._set_status("Stopped", "#888888")
+            self._set_status("Stopped", MD_TEXT2)
             self._set_run_state("stopped")
             return
         new = lower[0]
@@ -2085,7 +2833,12 @@ class App(tk.Tk):
         self.start()
 
     def _selected(self):
-        return next(p for p in PRESETS if p["name"] == self.choice.get())
+        """The chosen preset, or None while the dropdown still shows the placeholder."""
+        name = self.choice.get()
+        for p in PRESETS:
+            if p["name"] == name:
+                return p
+        return None
 
     def _sampler_args(self, p):
         """The preset's args with the chosen sampling mode applied."""
@@ -2114,13 +2867,15 @@ class App(tk.Tk):
                     "Restart to apply the new settings?",
                     "The running server was started with the old settings.\n\n"
                     "Restart it now? Any answer in progress will be cancelled."):
-                self.start()          # restart with the new settings
+                self._restart()          # restart with the new settings
             else:
                 self._log("[sampling] changed. Press RESTART when you are ready to apply it.")
         self._update_cmd()
 
     def _build_cmd(self):
         p = self._selected()
+        if p is None:
+            return []
         cmd = [p["exe"]] + self._sampler_args(p)
         if p["exe"] == "llama-server.exe":
             cmd += ["--port", self.port.get().strip() or DEFAULT_PORT]
@@ -2131,8 +2886,13 @@ class App(tk.Tk):
         return cmd
 
     def _update_cmd(self):
-        text = " ".join(self._build_cmd())
         p = self._selected()
+        if p is None:
+            self.cmd_label.config(text="Pick a model preset above, then press START.")
+            self._refresh_mem()
+            self._sync_buttons()
+            return
+        text = " ".join(self._build_cmd())
         rec = _auto_record(p)
         if rec:
             text += f"\n[auto ngl {rec['ngl']} (saved {rec.get('tested_at', '?')}); changes to the model file or ctx re-tune]"
@@ -2147,19 +2907,37 @@ class App(tk.Tk):
         self._refresh_mem()         # Memory tab: loads the file size + GGUF header for the selected model
 
     def _set_status(self, text, color):
-        self.status.config(text=f" {text} ", bg=color)
+        self.status.set(text, color)
 
-    def _set_run_state(self, state):
+    def _sync_buttons(self):
+        """The action buttons follow what the launcher is actually doing.
+
+        START needs a chosen preset and nothing running.
+        STOP is only alive while a model runs, while auto-tuning is in progress
+        or while the launcher is bringing a model up - there is nothing to stop
+        otherwise.
+        RESTART only makes sense while a model runs: it stops it and starts it
+        again with the settings that are on screen now.
+
+        The "starting" flag is what keeps the buttons still while the launcher
+        moves from auto-tuning to a running server: without it the buttons
+        would go to the stopped look, and then flip over again when the
+        server process appears.
+        """
         if not hasattr(self, "start_btn"):
             return
-        if state == "running":
-            self.start_btn.config(text="●  RUNNING", state="disabled")
-        elif state == "starting":
-            self.start_btn.config(text="⏳  LOADING…", state="disabled")
-        elif state == "tuning":
-            self.start_btn.config(text="⚙  Auto-tuning NGL…", state="disabled")
-        else:
-            self.start_btn.config(text="▶  START", state="normal")
+        running = bool(self.proc and self.proc.poll() is None)
+        tuning = bool(self.tuning)
+        starting = bool(getattr(self, "starting", False))
+        has_preset = self._selected() is not None
+        self.start_btn.set_enabled(has_preset and not running and not tuning and not starting)
+        self.stop_btn.set_enabled(running or tuning or starting)
+        self.restart_btn.set_enabled(running and not tuning)
+
+    def _set_run_state(self, state):
+        # The state itself is shown by the status chip; the buttons are
+        # switched on and off here.
+        self._sync_buttons()
 
     def _log(self, text):
         self.log.insert("end", text if text.endswith("\n") else text + "\n")
@@ -2167,11 +2945,40 @@ class App(tk.Tk):
             self.log.delete("1.0", "500.0")
         self.log.see("end")
 
+    def _restart(self):
+        """Restart the running model with the settings that are on screen now.
+
+        This is the button that makes a changed Sampling mode take effect:
+        the running server keeps the settings it was started with, and the
+        restart replaces them.  An answer in progress is cancelled.
+        """
+        if self._selected() is None:
+            if self.run_preset is not None:
+                self.choice.set(self.run_preset["name"])
+                self._update_cmd()
+            else:
+                messagebox.showinfo("No preset selected",
+                                    "Pick a model preset in the dropdown first.")
+                return
+        # The old server goes away first, so a restart that has to auto-tune
+        # does not tune next to a model that is still running.
+        self.run_auto = False
+        self.gen += 1
+        self.starting = True
+        self._stop_process()
+        self._set_status("Restarting…", MD_WARN)
+        self._sync_buttons()
+        self.start()
+
     def start(self):
         if self.tuning:
             messagebox.showinfo("Auto-tuning NGL", "Wait for auto-tuning to finish, or press STOP to cancel it.")
             return
         p = self._selected()
+        if p is None:
+            messagebox.showinfo("No preset selected",
+                                "Pick a model preset in the dropdown first, then press START.")
+            return
         rec = _auto_record(p)
         mismatch = _sampling_mismatch(rec, self.sampling_mode.get())
         if _auto_applies(p) and _auto_key(p) is not None:
@@ -2193,56 +3000,74 @@ class App(tk.Tk):
                 self._begin_tuning(p, reason=f"more free RAM than at tuning time, retuning for a higher -ngl")
                 return
         cmd = self._build_cmd()
-        port_value = self.port.get().strip() or DEFAULT_PORT
+        # Every way out of this block has to undo the "starting" flag, or the
+        # buttons would stay frozen in the starting look for ever.  The finally
+        # clause does that for every early return.
         try:
-            port_number = int(port_value)
-            if not 1 <= port_number <= 65535:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("Invalid port", "Enter a TCP port number from 1 to 65535.")
-            return
-        exe_path = os.path.join(BASE_DIR, cmd[0])
-        if not os.path.isfile(exe_path):
-            messagebox.showerror("Not found", f"{exe_path} does not exist.\nCheck BASE_DIR in the script.")
-            return
-        # FIX 4: explicit missing-file check at Start, since we no longer hide presets
-        sel = self.choice.get()
-        if sel in MISSING_FILES and MISSING_FILES[sel]:
-            messagebox.showerror("Missing file", f"Preset '{sel}' is missing in {BASE_DIR}:\n{', '.join(MISSING_FILES[sel])}")
-            return
-        model = cmd[cmd.index("-m") + 1]
-        if not os.path.isfile(os.path.join(BASE_DIR, os.path.basename(model))):
-            messagebox.showerror("Model not found", f"{os.path.join(BASE_DIR, model)} does not exist.")
-            return
-        self._stop_process()
-        self._wait_ram()
-        # After the old server is gone and its memory has come back, so the
-        # reading is what the new server actually gets.
-        self._ram_warning(p)
-        self.gen += 1
-        gen = self.gen
-        auto = _auto_applies(p) and _auto_key(p) is not None
-        self.run_auto = auto
-        self.run_preset = p
-        self.run_ngl = int(cmd[cmd.index("-ngl") + 1]) if auto and "-ngl" in cmd else None
-        self.oom_pending = False
-        self._reset_mem()
-        self._log(f"\n=== START: {' '.join(cmd)} ===")
-        try:
-            self.proc = subprocess.Popen(
-                [exe_path] + cmd[1:], cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
-        except Exception as e:
-            messagebox.showerror("Failed to start", str(e))
-            self._set_status("Stopped", "#888888")
-            self._set_run_state("stopped")
-            return
-        # Remember what the running server was started with, so a later change
-        # to the sampling can be reported as "not applied yet".
-        self.run_mode = self.sampling_mode.get()
-        self._set_status("Starting…", "#d98c00")
-        self._set_run_state("starting")
-        threading.Thread(target=self._reader, args=(self.proc, gen), daemon=True).start()
+            port_value = self.port.get().strip() or DEFAULT_PORT
+            try:
+                port_number = int(port_value)
+                if not 1 <= port_number <= 65535:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid port", "Enter a TCP port number from 1 to 65535.")
+                return
+            exe_path = os.path.join(BASE_DIR, cmd[0])
+            if not os.path.isfile(exe_path):
+                messagebox.showerror("Not found", f"{exe_path} does not exist.\nCheck BASE_DIR in the script.")
+                return
+            # FIX 4: explicit missing-file check at Start, since we no longer hide presets
+            sel = self.choice.get()
+            if sel in MISSING_FILES and MISSING_FILES[sel]:
+                messagebox.showerror("Missing file", f"Preset '{sel}' is missing in {BASE_DIR}:\n{', '.join(MISSING_FILES[sel])}")
+                return
+            model = cmd[cmd.index("-m") + 1]
+            if not os.path.isfile(os.path.join(BASE_DIR, os.path.basename(model))):
+                messagebox.showerror("Model not found", f"{os.path.join(BASE_DIR, model)} does not exist.")
+                return
+            # From here on the launcher is busy.  The flag keeps the buttons in
+            # the "starting" look while the old server is stopped and the RAM of
+            # the dead one comes back - that wait repaints the window, and without
+            # the flag the buttons would flip to the stopped look and back again.
+            self.starting = True
+            self._sync_buttons()
+            self._stop_process()
+            self._wait_ram()
+            # After the old server is gone and its memory has come back, so the
+            # reading is what the new server actually gets.
+            self._ram_warning(p)
+            self.gen += 1
+            gen = self.gen
+            auto = _auto_applies(p) and _auto_key(p) is not None
+            self.run_auto = auto
+            self.run_preset = p
+            self.run_ngl = int(cmd[cmd.index("-ngl") + 1]) if auto and "-ngl" in cmd else None
+            self.oom_pending = False
+            self._reset_mem()
+            self._log(f"\n=== START: {' '.join(cmd)} ===")
+            try:
+                self.proc = subprocess.Popen(
+                    [exe_path] + cmd[1:], cwd=BASE_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+            except Exception as e:
+                messagebox.showerror("Failed to start", str(e))
+                self._set_status("Stopped", MD_TEXT2)
+                self._set_run_state("stopped")
+                return
+            # Remember what the running server was started with, so a later change
+            # to the sampling can be reported as "not applied yet".
+            self.run_mode = self.sampling_mode.get()
+            # The server process exists now, so the buttons follow the process.
+            self.starting = False
+            self._set_status("Starting…", MD_WARN)
+            self._set_run_state("starting")
+            threading.Thread(target=self._reader, args=(self.proc, gen), daemon=True).start()
+        finally:
+            # Nothing is running (we bailed out, or the server never came up):
+            # the starting look has to go, or the buttons stay frozen.
+            if not (self.proc and self.proc.poll() is None):
+                self.starting = False
+                self._sync_buttons()
 
     def _reader(self, proc, gen):
         for line in proc.stdout:
@@ -2314,7 +3139,7 @@ class App(tk.Tk):
         which looks like a much lower limit than it really is.
         """
         try:
-            self._set_status("Waiting for RAM…", "#d98c00")
+            self._set_status("Waiting for RAM…", MD_WARN)
             self.update_idletasks()
         except Exception:
             pass
@@ -2336,10 +3161,11 @@ class App(tk.Tk):
             kill_all_llama()          # the trial server dies; the worker then reports "cancelled"
             self._log("[auto ngl] stop requested")
             return
+        self.starting = False
         self.run_auto = False
         self.gen += 1
         self._stop_process()
-        self._set_status("Stopped", "#888888")
+        self._set_status("Stopped", MD_TEXT2)
         self._set_run_state("stopped")
         self._log("=== STOPPED ===")
         if self.auto_clear.get():
@@ -2347,40 +3173,65 @@ class App(tk.Tk):
 
     def clear_ram(self):
         # Only request a standby/file-cache flush here. Other apps' working sets
-        # can be trimmed individually in the Cleaner after explicit selection.
+        # can be trimmed individually in the Free RAM window after explicit
+        # selection - that part does not need administrator rights.
+        if not self.admin:
+            self._log("[file cache] not administrator - Windows only lets an administrator "
+                      "flush the file cache. Start the launcher as administrator for that.")
+            return
         before = ram_info()[0]
         ok, msg = clear_standby_ram()
         time.sleep(0.3)
         after = ram_info()[0]
         self._log(f"[file cache] {msg}  (RAM used {before:.1f} GB -> {after:.1f} GB)")
 
-    def open_cleaner(self):
+    def open_free_ram(self):
+        """The "Free RAM" window: which app holds the memory, and let it go.
+
+        The old name for this was "Cleaner", which said nothing about what it
+        cleaned.  What it does is trim the working set of the apps you pick, so
+        they hand their memory back to Windows.
+        """
         if getattr(self, "cleaner", None) and self.cleaner.winfo_exists():
             self.cleaner.lift()
             return
         w = tk.Toplevel(self)
-        w.title("Memory cleaner")
-        w.geometry("560x580")
+        w.title("Free RAM")
+        w.geometry("600x600")
+        w.configure(bg=MD_BG)
         self.cleaner = w
-        usage = ttk.Label(w, font=("Segoe UI", 10, "bold"))
-        usage.pack(anchor="w", padx=12, pady=(10, 2))
+        head = tk.Frame(w, bg=MD_BG)
+        head.pack(fill="x", padx=18, pady=(16, 0))
+        tk.Label(head, text="Free RAM", bg=MD_BG, fg=MD_TEXT,
+                 font=("Segoe UI", 16, "bold")).pack(anchor="w")
+        tk.Label(head, text="Pick the apps that are holding memory and give some back. "
+                            "Windows puts the memory back when the app needs it again.",
+                 bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S, justify="left", wraplength=560,
+                 anchor="w").pack(anchor="w", pady=(4, 0))
+        tk.Label(head, text="Apps that run as administrator cannot be trimmed from a standard "
+                            "user session - those rows are skipped.",
+                 bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S, justify="left", wraplength=560,
+                 anchor="w").pack(anchor="w", pady=(4, 0))
+        usage = tk.Label(w, text="", bg=MD_BG, fg=MD_TEXT, font=MD_FONT_B, anchor="w")
+        usage.pack(fill="x", padx=18, pady=(14, 4))
         bar = ttk.Progressbar(w, maximum=100)
-        bar.pack(fill="x", padx=12)
-        frame = ttk.Frame(w)
-        frame.pack(fill="both", expand=True, padx=12, pady=8)
+        bar.pack(fill="x", padx=18)
+        frame = tk.Frame(w, bg=MD_CARD, highlightbackground=MD_OUTLINE, highlightthickness=1)
+        frame.pack(fill="both", expand=True, padx=18, pady=12)
         tree = ttk.Treeview(frame, columns=("name", "mem", "n"), show="headings", selectmode="extended")
         tree.heading("name", text="Application")
         tree.heading("mem", text="Memory")
         tree.heading("n", text="Procs")
-        tree.column("name", width=280)
-        tree.column("mem", width=100, anchor="e")
+        tree.column("name", width=300)
+        tree.column("mem", width=110, anchor="e")
         tree.column("n", width=60, anchor="e")
-        sb = ttk.Scrollbar(frame, command=tree.yview)
+        sb = ttk.Scrollbar(frame, command=tree.yview, style="Vertical.TScrollbar")
         tree.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         tree.pack(side="left", fill="both", expand=True)
-        info = ttk.Label(w, text="Ctrl/Shift-click to select several apps.", foreground="#666")
-        info.pack(anchor="w", padx=12)
+        info = tk.Label(w, text="Ctrl/Shift-click to select several apps.",
+                        bg=MD_BG, fg=MD_TEXT2, font=MD_FONT_S, anchor="w")
+        info.pack(anchor="w", padx=18)
         def refresh():
             used, total, pct = ram_info()
             usage.config(text=f"Memory usage {pct}%   ({used:.1f} GB / {total:.1f} GB)")
@@ -2392,12 +3243,12 @@ class App(tk.Tk):
             self._groups = groups
         def clean(names):
             if not names:
-                messagebox.showinfo("Memory cleaner", "Select at least one app.", parent=w)
+                messagebox.showinfo("Free RAM", "Select at least one app.", parent=w)
                 return
             pids = [pid for n in names for pid in self._groups[n]["pids"]]
             released, failed = trim_pids(pids)
             note = f"\n({failed} processes were protected and skipped)" if failed else ""
-            messagebox.showinfo("Memory cleaned", f"Successfully released {released / 1024**2:,.0f} MB of memory.{note}", parent=w)
+            messagebox.showinfo("Memory freed", f"Released {released / 1024**2:,.0f} MB of memory.{note}", parent=w)
             refresh()
         def clean_selected():
             names = list(tree.selection())
@@ -2405,17 +3256,75 @@ class App(tk.Tk):
                 if not messagebox.askyesno("Model is running", "Trimming a running llama-server forces its memory to be re-read and slows generation. Continue?", parent=w):
                     return
             clean(names)
-        row = ttk.Frame(w)
-        row.pack(fill="x", padx=12, pady=(0, 10))
+        row = tk.Frame(w, bg=MD_BG)
+        row.pack(fill="x", padx=18, pady=(0, 16))
         ttk.Button(row, text="Refresh", command=refresh).pack(side="left")
         ttk.Button(row, text="Select all", command=lambda: tree.selection_set(tree.get_children())).pack(side="left", padx=6)
-        ttk.Button(row, text="Flush Windows cache (admin)", command=lambda: (self._log("[cache] " + clear_standby_ram()[1]), refresh())).pack(side="left")
-        ttk.Button(row, text="CLEAN SELECTED", style="Big.TButton", command=clean_selected).pack(side="right")
+        if self.admin:
+            ttk.Button(row, text="Flush Windows cache",
+                       command=lambda: (self._log("[cache] " + clear_standby_ram()[1]), refresh())).pack(side="left")
+        else:
+            ttk.Button(row, text="Flush Windows cache (needs administrator)",
+                       state="disabled").pack(side="left")
+        MatButton(row, "FREE SELECTED RAM", command=clean_selected,
+                  color=MD_PRIMARY, color_dark=MD_PRIMARY_D, bg=MD_BG, font=MD_FONT,
+                  tooltip="Trim the memory of the selected apps, so Windows can use it "
+                          "for the model.").pack(side="right")
         refresh()
 
-    def _relaunch_admin(self):
+    def _relaunch_admin(self, confirm=True):
+        """Close this window and open the launcher as administrator.
+
+        The running model has to go down for that, so the user is told before
+        it happens, and the current launcher closes only once the new one has
+        actually been started.
+        """
+        if confirm:
+            running = bool(self.proc and self.proc.poll() is None)
+            if self.tuning:
+                what = ("The auto-NGL tuning is still running. It will be cancelled and the "
+                        "value found so far will not be saved.")
+            elif running:
+                name = self.run_preset["name"] if self.run_preset else "the model"
+                what = (f"The running model ({name}) will be stopped, and any answer in "
+                        f"progress is cancelled.")
+            else:
+                what = "No model is running, so nothing is interrupted."
+            if not messagebox.askyesno(
+                    "Start as administrator?",
+                    f"This launcher will close and open again as administrator.\n\n{what}\n\n"
+                    "Windows will ask you to confirm."):
+                return
+        # Nothing should be left running when the window goes away.
+        if self.tuning and self.auto_cancel is not None:
+            self.auto_cancel.set()
+            kill_all_llama()
+            self.tuning = False
+        self.starting = False
+        self.run_auto = False
+        self.gen += 1
         self._stop_process()
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{os.path.abspath(__file__)}"', None, 1)
+        try:
+            shell32 = ctypes.windll.shell32
+            # The return value is an HINSTANCE, which is 64 bit on a 64 bit
+            # Windows.  Without this, ctypes cuts it down to 32 bit and the
+            # "greater than 32" test below gives the wrong answer.
+            shell32.ShellExecuteW.restype = ctypes.c_void_p
+            rc = shell32.ShellExecuteW(
+                None, "runas", sys.executable, f'"{os.path.abspath(__file__)}"', None, 1)
+        except Exception as e:
+            write_error_log(traceback.format_exc())
+            messagebox.showerror("Could not start as administrator", str(e))
+            self._show_main_window()
+            return
+        if rc is None or rc <= 32:
+            # ShellExecute returns <= 32 when the request was refused, which
+            # is what happens when the UAC prompt is cancelled.
+            messagebox.showerror("Could not start as administrator",
+                                  "Windows did not start the elevated copy. The UAC prompt "
+                                  "was probably cancelled.")
+            self._show_main_window()
+            return
         self.destroy()
 
     def _on_close(self):
@@ -2449,7 +3358,7 @@ class App(tk.Tk):
                                     self.mem_base_cpu = max(0.0, priv - gsh)
                         except Exception:
                             pass
-                        self._set_status(f"Ready  :{self.port.get()}", "#2e8b57")
+                        self._set_status(f"Ready on port {self.port.get()}", MD_OK)
                         self._set_run_state("running")
                     if "processing task" in low:
                         self.mem_busy = True
@@ -2463,7 +3372,8 @@ class App(tk.Tk):
                         self._on_oom(gen)
                         return
                     self._log(f"=== process exited (code {data}) ===")
-                    self._set_status("Stopped", "#888888")
+                    self.starting = False
+                    self._set_status("Stopped", MD_TEXT2)
                     self._set_run_state("stopped")
                     self.proc = None
         except queue.Empty:
@@ -2471,9 +3381,12 @@ class App(tk.Tk):
         self.after(100, self._drain)
 
     def _tick(self):
-        used, total, pct = ram_info()
+        try:
+            used, total, pct = ram_info()
+        except Exception:
+            used, total, pct = 0.0, 0.0, 0
         self.ram_label.config(text=f"RAM: {used:.1f} / {total:.1f} GB ({pct}%)",
-                              foreground="#b03030" if pct >= 90 else "#000000")
+                              fg=MD_ERROR if pct >= 90 else MD_TEXT2)
         gpu = self.gpu_mem
         self.vram_label.config(text=f"GPU RAM: {gpu[0] + gpu[1]:,.0f} MiB (from system RAM)" if gpu else "")
         try:
@@ -2483,4 +3396,20 @@ class App(tk.Tk):
         self.after(1000, self._tick)
 
 if __name__ == "__main__":
-    App().mainloop()
+    try:
+        App().mainloop()
+    except Exception:
+        # The launcher must never die silently: show what went wrong, and
+        # keep a copy of the traceback next to the script.
+        detail = traceback.format_exc()
+        path = write_error_log(detail)
+        text = ("The launcher could not start.\n\n"
+                + detail.strip().splitlines()[-1]
+                + f"\n\nThe full details were written to:\n{path}")
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Llama Launcher", text, parent=root)
+            root.destroy()
+        except Exception:
+            pass

@@ -200,7 +200,7 @@ If you change your GPU driver, or you want to test again, just delete `auto_ngl.
 
 If auto-tune fails at every NGL, it shows an error. It does not silently fall back to CPU.
 
-## Memory breakdown, Clear RAM, and Cleaner
+## Memory breakdown, Clear File Cache, and Free RAM
 
 - The Memory breakdown tab shows: Model weights, KV cache, Recurrent state, Compute buffers, Output buffer, Prompt cache / growth, and Other host RAM.
 - Weights show the file size before start. After start, the split between graphics and processor comes from the llama.cpp log when the build prints buffer sizes. Builds that do not print them show the file size and estimate the split from GPU memory minus weights and KV, and the tab says so.
@@ -213,8 +213,8 @@ If auto-tune fails at every NGL, it shows an error. It does not silently fall ba
   Watch the "Prompt cache / growth" row on the Memory breakdown tab. If it stays at 0, nothing is being cached and the memory is better spent on the model.
 - Compute buffers are rough work for reading your question. Bigger batch is faster but needs more memory.
 - The launcher only kills its own server on Stop. It never kills another llama-server.exe on the machine.
-- "Clear RAM" flushes the Windows file cache. It needs admin. Use the "Restart as Admin" button once to enable the full flush.
-- "Cleaner" lets you select apps and trim their working sets. Trimming a running llama-server will slow generation, so it asks first.
+- "Clear File Cache" flushes the Windows file cache. It only shows in administrator mode. At startup the launcher asks Start normally or Start as administrator. The header badge always says which mode you are in.
+- "Free RAM" lets you select apps and trim their working sets. Trimming a running llama-server will slow generation, so it asks first.
 
 ## Reducing hallucinations
 
