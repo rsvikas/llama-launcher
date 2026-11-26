@@ -1,14 +1,7 @@
-﻿*.gguf
+*.gguf
 auto_ngl.json
 auto_ngl.json.tmp
 __pycache__/
 *.pyc
 USE_PRISM
 USE_Q2
-
-# PyInstaller build output - do not commit the exe, rebuild from .pyw
-LlamaLauncher.spec
-build/
-dist/
-*.exe
-launcher_error.log
